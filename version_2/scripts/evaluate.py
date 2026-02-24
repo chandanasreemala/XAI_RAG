@@ -21,6 +21,7 @@ Usage:
   ragex/bin/python scripts/evaluate.py \\
       --models google/flan-t5-large google/flan-t5-xl \\
                tiiuae/falcon-rw-1b \\
+      --retrieval_results_csv results/retrieval/per_query_results.csv \\
       --n_samples 200 \\
       --api_url http://localhost:8000 \\
       --k_docs 3 \\
@@ -461,8 +462,25 @@ def retrieve_for_question(
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        print(f"  [RETRIEVE ERROR] {exc}")
-        return []
+        return []   # caller handles empty list; connectivity checked at startup
+
+
+def check_api_reachable(api_url: str, timeout: int = 5) -> bool:
+    """
+    Probe the API with a lightweight health-check request.
+    Returns True if the server responds, False otherwise.
+    """
+    try:
+        resp = requests.get(f"{api_url}/health", timeout=timeout)
+        return resp.status_code < 500
+    except Exception:
+        pass
+    # Fallback: try the root path
+    try:
+        resp = requests.get(api_url, timeout=timeout)
+        return resp.status_code < 500
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -553,6 +571,7 @@ def run_retrieval_and_explanation_eval(
     args:             argparse.Namespace,
     retriever:        str,
     precomputed:      Dict[Tuple[str, str], Dict[str, float]],
+    api_online:       bool = True,
 ) -> Tuple[Dict[str, Dict], Dict[str, List[float]], List[float], List[float]]:
     """
     Calls /explain for each sample × each importance_mode.
@@ -573,33 +592,41 @@ def run_retrieval_and_explanation_eval(
     all_dissim:  List[float] = []
     all_conf_drop: List[float] = []
 
-    total = len(samples)
+    total        = len(samples)
+    print_step   = max(1, total // 10)   # print at every 10% milestone
     for idx, sample in enumerate(samples):
         q   = sample["question"]
         ans = sample["answer"]
         qid = sample["qid"]
         gold_rel_ids = qid_to_rel_ids.get(qid, [])
 
-        print(f"  [{idx+1}/{total}] {q[:70]}...")
+        if idx == 0 or (idx + 1) % print_step == 0 or (idx + 1) == total:
+            print(f"  [{idx+1}/{total}] {q[:80]}...")
 
         # ── Check for pre-computed retrieval metrics ───────────────────────────
         precomp_key = (sample["id"], retriever)
         precomp_ret = precomputed.get(precomp_key)  # None if not found
 
+        # If API is offline and no precomputed data, nothing to do for this sample
+        if not api_online and precomp_ret is None:
+            continue
+
         for mode in args.importance_modes:
             needs_debug = (mode == "confidence_retrieval_fusion")
-            result = call_explain_api(
-                api_url          = args.api_url,
-                question         = q,
-                retriever        = retriever,
-                k_docs           = args.k_docs,
-                explanation_level= args.explanation_level,
-                importance_mode  = mode,
-                alpha            = args.alpha,
-                debug            = needs_debug,
-            )
-            if result is None:
-                continue
+
+            if api_online:
+                result = call_explain_api(
+                    api_url          = args.api_url,
+                    question         = q,
+                    retriever        = retriever,
+                    k_docs           = args.k_docs,
+                    explanation_level= args.explanation_level,
+                    importance_mode  = mode,
+                    alpha            = args.alpha,
+                    debug            = needs_debug,
+                )
+            else:
+                result = None   # API offline — will use precomputed retrieval only
 
             # ── Retrieval metrics — from precomputed CSV or from API ────────────
             if mode == args.importance_modes[0]:
@@ -607,7 +634,7 @@ def run_retrieval_and_explanation_eval(
                     # Use pre-computed values — no recalculation needed
                     for metric in ("recall_at_k", "mrr", "map", "ndcg_at_k"):
                         ret_scores["retrieval"][metric].append(precomp_ret[metric])
-                else:
+                elif result is not None:
                     retrieved = result.get("retrieved_docs") or []
                     retrieved_ids = [
                         r["doc"]["id"] for r in retrieved
@@ -616,6 +643,9 @@ def run_retrieval_and_explanation_eval(
                     rm = compute_retrieval_metrics(retrieved_ids, gold_rel_ids, args.k_docs)
                     for metric, val in rm.items():
                         ret_scores["retrieval"][metric].append(val)
+
+            if result is None:
+                continue   # no explanation data available
 
             # ── Explanation metrics ──
             importance = result.get("token_importances", {})
@@ -674,16 +704,26 @@ def run_generation_eval(
         references:  List[str] = []
         questions:   List[str] = []
         contexts:    List[List[str]] = []
+        n_total    = len(samples)
+        print_step = max(1, n_total // 10)
+        api_errors = 0
 
         for idx, sample in enumerate(samples):
             q   = sample["question"]
             ans = sample["answer"]
-            print(f"    [{idx+1}/{len(samples)}] {q[:60]}...")
+
+            if idx == 0 or (idx + 1) % print_step == 0 or (idx + 1) == n_total:
+                print(f"    [{idx+1}/{n_total}] {q[:70]}...")
 
             # Retrieve context
             retrieved = retrieve_for_question(
                 args.api_url, q, args.retriever, args.k_docs
             )
+            if not retrieved:
+                api_errors += 1
+                if api_errors == 3:
+                    print(f"    [WARN] API unreachable — skipping remaining {n_total - idx - 1} questions for {model_id}.")
+                    break
             retrieved_texts = [
                 r["doc"]["text"] for r in retrieved
                 if isinstance(r, dict) and "doc" in r and "text" in r["doc"]
@@ -877,6 +917,16 @@ def main() -> None:
         print("\n  Loading pre-computed retrieval metrics...")
         precomputed = load_precomputed_retrieval(args.retrieval_results_csv)
 
+    # ── Check API connectivity once ────────────────────────────────────────────
+    print(f"\n  Checking API connectivity at {args.api_url} ...")
+    api_online = check_api_reachable(args.api_url)
+    if api_online:
+        print("  API is reachable. Explanation and generation evaluation will run.")
+    else:
+        print(f"  [WARN] API at {args.api_url} is NOT reachable.")
+        print("         → Explanation + generation evaluation will be SKIPPED.")
+        print("         Start the server with: uvicorn app.api:app --port 8000")
+
     # ── Retrieval + Explanation evaluation — looped per retriever ──────────────
     print("\n[2/4] Retrieval + Explanation evaluation (via /explain API)...")
 
@@ -891,8 +941,13 @@ def main() -> None:
         src = f"pre-computed ({precomp_count} rows)" if precomp_count else "API (live)"
         print(f"\n  ▶  Retriever: {retriever.upper()}  [retrieval source: {src}]")
 
+        if not api_online and precomp_count == 0:
+            # Nothing to compute — no API and no pre-computed data for this retriever
+            print(f"  [SKIP] No API and no pre-computed data for '{retriever}'. Skipping.")
+            continue
+
         mode_metrics, _, all_dissim, all_conf_drop = run_retrieval_and_explanation_eval(
-            samples, qid_to_rel_ids, args, retriever, precomputed
+            samples, qid_to_rel_ids, args, retriever, precomputed, api_online
         )
 
         # Store retrieval metrics for per-retriever comparison plot
@@ -926,9 +981,12 @@ def main() -> None:
 
     # ── Generation quality evaluation per model (uses first retriever) ─────────
     print("\n[3/4] Generation quality evaluation per HuggingFace model...")
-    # Temporarily set a single retriever for generation (first in list)
     args.retriever = args.retrievers[0]
-    generation_results = run_generation_eval(samples, args, hf_token)
+    if not api_online:
+        print("  [SKIP] API not reachable — skipping generation evaluation.")
+        generation_results = {}
+    else:
+        generation_results = run_generation_eval(samples, args, hf_token)
 
     # ── Display results ────────────────────────────────────────────────────────
 
