@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+ragex/
+venv/
+env/
+.venv/
+
+# Sensitive config
+.env
+
+# Large data files — indices and raw datasets
+*.pkl
+*.index
+data/hotpot/hotpot_docs.jsonl
+data/hotpot/hotpot_answers.jsonl
+data/hotpot/hotpotqa_fulldataset_cleaned.csv
+data/trivia/trivia_docs.jsonl
+data/trivia/trivia_answers.jsonl
+data/halubench/halubench_docs.jsonl
+data/halubench/halubench_answers.jsonl
+data/docs.jsonl
+
+# Generated results
+results/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PDFs
+*.pdf
