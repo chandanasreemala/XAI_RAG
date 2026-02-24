@@ -74,8 +74,16 @@ def parse_args() -> argparse.Namespace:
         help="Number of documents to retrieve (default: 3).",
     )
     p.add_argument(
-        "--retriever", default="dense", choices=["dense", "bm25", "hybrid"],
-        help="Retriever to use (default: dense).",
+        "--retrievers", nargs="+", default=["dense", "bm25", "hybrid"],
+        choices=["dense", "bm25", "hybrid"],
+        help="Retrievers to evaluate (default: all three).",
+    )
+    p.add_argument(
+        "--retrieval_results_csv", default=None,
+        metavar="PATH",
+        help="Path to an existing per_query_results.csv from evaluate_retrieval.py.\n"
+             "If provided, retrieval metrics are loaded from this file instead of\n"
+             "being recalculated via the /explain API.",
     )
     p.add_argument(
         "--explanation_level", default="sentence",
@@ -169,7 +177,42 @@ def load_data(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3.  Text Normalisation (shared by EM, Token-F1, Explanation-F1)
+# 3.  Pre-computed Retrieval Results Loader
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_precomputed_retrieval(csv_path: str) -> Dict[Tuple[str, str], Dict[str, float]]:
+    """
+    Load retrieval metrics from a per_query_results.csv produced by
+    evaluate_retrieval.py.
+
+    Returns a dict keyed by (question_id, retriever) → {metric: value}
+    so that evaluate.py can skip recomputing retrieval when these are
+    already available.
+
+    Expected CSV columns (at minimum):
+        question_id, retriever, recall_at_k, mrr, map, ndcg_at_k
+    """
+    result: Dict[Tuple[str, str], Dict[str, float]] = {}
+    if not csv_path or not os.path.isfile(csv_path):
+        return result
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = (row["question_id"].strip(), row["retriever"].strip())
+            result[key] = {
+                "recall_at_k": float(row.get("recall_at_k", 0)),
+                "mrr":         float(row.get("mrr",         0)),
+                "map":         float(row.get("map",         0)),
+                "ndcg_at_k":   float(row.get("ndcg_at_k",  0)),
+                "retrieved_doc_ids": row.get("retrieved_doc_ids", ""),
+            }
+    print(f"  Loaded {len(result)} pre-computed retrieval rows from {csv_path}.")
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5.  Text Normalisation (shared by EM, Token-F1, Explanation-F1)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _normalise_text(text: str) -> str:
@@ -201,7 +244,7 @@ def exact_match(pred: str, gold: str) -> float:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 4.  Retrieval Effectiveness Metrics
+# 6.  Retrieval Effectiveness Metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _dcg(relevances: List[int]) -> float:
@@ -265,7 +308,7 @@ def compute_retrieval_metrics(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5.  Explanation Quality Metrics
+# 7.  Explanation Quality Metrics
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_explanation_metrics(
@@ -306,7 +349,7 @@ def compute_explanation_metrics(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6.  Confidence Signal — Spearman Rank Correlation
+# 8.  Confidence Signal — Spearman Rank Correlation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_spearman(
@@ -329,7 +372,7 @@ def compute_spearman(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 7.  API Calls — /explain endpoint
+# 9.  API Calls — /explain endpoint
 # ──────────────────────────────────────────────────────────────────────────────
 
 def call_explain_api(
@@ -370,7 +413,7 @@ def call_explain_api(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 8.  HuggingFace Inference API — multi-model generation
+# 10. HuggingFace Inference API — multi-model generation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def generate_via_hf_api(
@@ -423,7 +466,7 @@ def retrieve_for_question(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 9.  BERTScore — batch evaluation after collecting all predictions
+# 11. BERTScore — batch evaluation after collecting all predictions
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_bertscore(
@@ -446,7 +489,7 @@ def compute_bertscore(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 10. RAGAS — batch evaluation
+# 12. RAGAS — batch evaluation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_ragas_metrics(
@@ -497,7 +540,7 @@ def compute_ragas_metrics(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 11. Main Evaluation Loop
+# 13. Main Evaluation Loop
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _mean(values: List[float]) -> float:
@@ -508,9 +551,15 @@ def run_retrieval_and_explanation_eval(
     samples:          List[Dict],
     qid_to_rel_ids:   Dict[str, List[str]],
     args:             argparse.Namespace,
+    retriever:        str,
+    precomputed:      Dict[Tuple[str, str], Dict[str, float]],
 ) -> Tuple[Dict[str, Dict], Dict[str, List[float]], List[float], List[float]]:
     """
     Calls /explain for each sample × each importance_mode.
+
+    If precomputed contains an entry for (sample["id"], retriever), the
+    retrieval metrics are taken from there instead of from the API response,
+    saving time when evaluate_retrieval.py has already been run.
 
     Returns:
         mode_metrics     — {mode: {metric: mean_score}}
@@ -533,12 +582,16 @@ def run_retrieval_and_explanation_eval(
 
         print(f"  [{idx+1}/{total}] {q[:70]}...")
 
+        # ── Check for pre-computed retrieval metrics ───────────────────────────
+        precomp_key = (sample["id"], retriever)
+        precomp_ret = precomputed.get(precomp_key)  # None if not found
+
         for mode in args.importance_modes:
             needs_debug = (mode == "confidence_retrieval_fusion")
             result = call_explain_api(
                 api_url          = args.api_url,
                 question         = q,
-                retriever        = args.retriever,
+                retriever        = retriever,
                 k_docs           = args.k_docs,
                 explanation_level= args.explanation_level,
                 importance_mode  = mode,
@@ -548,16 +601,21 @@ def run_retrieval_and_explanation_eval(
             if result is None:
                 continue
 
-            # ── Retrieval metrics (same result regardless of mode, run once) ──
+            # ── Retrieval metrics — from precomputed CSV or from API ────────────
             if mode == args.importance_modes[0]:
-                retrieved = result.get("retrieved_docs") or []
-                retrieved_ids = [
-                    r["doc"]["id"] for r in retrieved
-                    if isinstance(r, dict) and "doc" in r and "id" in r["doc"]
-                ]
-                rm = compute_retrieval_metrics(retrieved_ids, gold_rel_ids, args.k_docs)
-                for metric, val in rm.items():
-                    ret_scores["retrieval"][metric].append(val)
+                if precomp_ret is not None:
+                    # Use pre-computed values — no recalculation needed
+                    for metric in ("recall_at_k", "mrr", "map", "ndcg_at_k"):
+                        ret_scores["retrieval"][metric].append(precomp_ret[metric])
+                else:
+                    retrieved = result.get("retrieved_docs") or []
+                    retrieved_ids = [
+                        r["doc"]["id"] for r in retrieved
+                        if isinstance(r, dict) and "doc" in r and "id" in r["doc"]
+                    ]
+                    rm = compute_retrieval_metrics(retrieved_ids, gold_rel_ids, args.k_docs)
+                    for metric, val in rm.items():
+                        ret_scores["retrieval"][metric].append(val)
 
             # ── Explanation metrics ──
             importance = result.get("token_importances", {})
@@ -676,7 +734,7 @@ def run_generation_eval(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 12. Results Output
+# 14. Results Output
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _print_table(title: str, rows: List[Dict[str, Any]], key_col: str) -> None:
@@ -714,7 +772,73 @@ def fmt(v: Any) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 13. Entry Point
+# 15. Comparison Plots
+# ──────────────────────────────────────────────────────────────────────────────
+
+RETRIEVER_COLOURS = {"dense": "#2563eb", "bm25": "#16a34a", "hybrid": "#dc2626"}
+METRIC_LABELS = {
+    "recall_at_k": "Recall@K", "mrr": "MRR", "map": "MAP", "ndcg_at_k": "NDCG@K"
+}
+
+
+def plot_retriever_comparison(
+    retriever_metrics: Dict[str, Dict[str, float]],
+    k: int,
+    out_dir: str,
+) -> None:
+    """
+    Grouped bar chart comparing all evaluated retrievers across 4 IR metrics.
+    retriever_metrics: {retriever_name: {metric: mean_score}}
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+
+        metrics    = list(METRIC_LABELS.keys())
+        labels     = [METRIC_LABELS[m] for m in metrics]
+        retrievers = sorted(retriever_metrics.keys())
+        n          = len(retrievers)
+        x          = np.arange(len(labels))
+        width      = 0.25
+        offsets    = np.linspace(-(n - 1) * width / 2, (n - 1) * width / 2, n)
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for i, ret in enumerate(retrievers):
+            values = [retriever_metrics[ret].get(m, 0.0) for m in metrics]
+            bars   = ax.bar(x + offsets[i], values, width,
+                            label=ret.upper(),
+                            color=RETRIEVER_COLOURS.get(ret, "#888888"),
+                            edgecolor="white", linewidth=0.6)
+            for bar, val in zip(bars, values):
+                ax.text(bar.get_x() + bar.get_width() / 2,
+                        bar.get_height() + 0.005,
+                        f"{val:.3f}", ha="center", va="bottom", fontsize=7.5)
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=11)
+        ax.set_ylim(0, 1.12)
+        ax.set_ylabel("Score", fontsize=11)
+        ax.set_title(f"Retrieval Effectiveness Comparison  (k={k})", fontsize=12)
+        ax.legend(title="Retriever", fontsize=9)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+        ax.set_axisbelow(True)
+
+        plots_dir = os.path.join(out_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        path = os.path.join(plots_dir, "retriever_comparison.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved plot: {path}")
+    except Exception as exc:
+        print(f"  [WARN] Retriever comparison plot failed: {exc}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 16. Entry Point
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -734,8 +858,10 @@ def main() -> None:
     print(f"  RAG-Ex Evaluation")
     print(f"  Models     : {args.models}")
     print(f"  N Samples  : {args.n_samples}")
-    print(f"  Retriever  : {args.retriever}  k={args.k_docs}")
+    print(f"  Retrievers : {args.retrievers}  k={args.k_docs}")
     print(f"  Modes      : {args.importance_modes}")
+    if args.retrieval_results_csv:
+        print(f"  Pre-computed retrieval: {args.retrieval_results_csv}")
     print(f"{'='*60}\n")
 
     # ── Load data ──────────────────────────────────────────────────────────────
@@ -745,46 +871,84 @@ def main() -> None:
     )
     print(f"      {len(samples)} unique questions loaded.")
 
-    # ── Retrieval + Explanation evaluation ────────────────────────────────────
+    # ── Load pre-computed retrieval results (optional) ─────────────────────────
+    precomputed: Dict[Tuple[str, str], Dict[str, float]] = {}
+    if args.retrieval_results_csv:
+        print("\n  Loading pre-computed retrieval metrics...")
+        precomputed = load_precomputed_retrieval(args.retrieval_results_csv)
+
+    # ── Retrieval + Explanation evaluation — looped per retriever ──────────────
     print("\n[2/4] Retrieval + Explanation evaluation (via /explain API)...")
-    mode_metrics, _, all_dissim, all_conf_drop = run_retrieval_and_explanation_eval(
-        samples, qid_to_rel_ids, args
-    )
 
-    # ── Confidence signal correlation ─────────────────────────────────────────
-    spearman_result: Dict[str, float] = {}
-    if "confidence_retrieval_fusion" in args.importance_modes and all_dissim:
-        print(f"\n[3/4] Spearman correlation: {len(all_dissim)} (unit, query) pairs...")
-        spearman_result = compute_spearman(all_dissim, all_conf_drop)
-        print(f"      ρ = {spearman_result['spearman_rho']:.4f}  "
-              f"p = {spearman_result['spearman_p']:.4g}")
-    else:
-        print("\n[3/4] Skipping Spearman (confidence_retrieval_fusion not in modes).")
+    # Accumulate retrieval metrics per retriever for comparison plot
+    retriever_ret_metrics: Dict[str, Dict[str, float]] = {}
 
-    # ── Generation quality evaluation per model ────────────────────────────────
-    print("\n[4/4] Generation quality evaluation per HuggingFace model...")
+    all_retr_expl_rows = []
+    all_spearman_rows  = []
+
+    for retriever in args.retrievers:
+        precomp_count = sum(1 for (_, r) in precomputed if r == retriever)
+        src = f"pre-computed ({precomp_count} rows)" if precomp_count else "API (live)"
+        print(f"\n  ▶  Retriever: {retriever.upper()}  [retrieval source: {src}]")
+
+        mode_metrics, _, all_dissim, all_conf_drop = run_retrieval_and_explanation_eval(
+            samples, qid_to_rel_ids, args, retriever, precomputed
+        )
+
+        # Store retrieval metrics for per-retriever comparison plot
+        retriever_ret_metrics[retriever] = mode_metrics.get("retrieval", {})
+
+        # ── Spearman per retriever ─────────────────────────────────────────────
+        if "confidence_retrieval_fusion" in args.importance_modes and all_dissim:
+            sp = compute_spearman(all_dissim, all_conf_drop)
+            all_spearman_rows.append({
+                "retriever":   retriever,
+                "signal_pair": "w'_i vs Δc_i",
+                **{k: fmt(v) for k, v in sp.items()},
+            })
+
+        # Build rows for CSV
+        ret_row = {
+            "retriever": retriever,
+            "metric_group": "retrieval",
+            **{k: fmt(v) for k, v in mode_metrics.get("retrieval", {}).items()},
+        }
+        all_retr_expl_rows.append(ret_row)
+
+        for mode in args.importance_modes:
+            key = f"explanation_{mode}"
+            if key in mode_metrics:
+                all_retr_expl_rows.append({
+                    "retriever":        retriever,
+                    "metric_group":     f"explanation_{mode}",
+                    **{k: fmt(v) for k, v in mode_metrics[key].items()},
+                })
+
+    # ── Generation quality evaluation per model (uses first retriever) ─────────
+    print("\n[3/4] Generation quality evaluation per HuggingFace model...")
+    # Temporarily set a single retriever for generation (first in list)
+    args.retriever = args.retrievers[0]
     generation_results = run_generation_eval(samples, args, hf_token)
 
-    # ── Assemble and display results ───────────────────────────────────────────
+    # ── Display results ────────────────────────────────────────────────────────
 
-    # Table 1: Retrieval metrics
-    ret_row = {"metric_group": "retrieval", **{k: fmt(v) for k, v in mode_metrics.get("retrieval", {}).items()}}
-    _print_table("RETRIEVAL EFFECTIVENESS", [ret_row], "metric_group")
+    # Table: Retrieval metrics per retriever
+    ret_display = [
+        {"retriever": r, **{k: fmt(v) for k, v in metrics.items()}}
+        for r, metrics in retriever_ret_metrics.items()
+    ]
+    _print_table("RETRIEVAL EFFECTIVENESS — ALL RETRIEVERS", ret_display, "retriever")
 
-    # Table 2: Explanation metrics per mode
-    expl_rows = []
-    for mode in args.importance_modes:
-        key = f"explanation_{mode}"
-        if key in mode_metrics:
-            expl_rows.append({"importance_mode": mode, **{k: fmt(v) for k, v in mode_metrics[key].items()}})
-    _print_table("EXPLANATION QUALITY", expl_rows, "importance_mode")
+    # Table: Explanation metrics
+    expl_display = [r for r in all_retr_expl_rows if "explanation" in r.get("metric_group", "")]
+    if expl_display:
+        _print_table("EXPLANATION QUALITY", expl_display, "retriever")
 
-    # Table 3: Spearman
-    if spearman_result:
-        sp_row = {"signal_pair": "w'_i vs Δc_i", **{k: fmt(v) for k, v in spearman_result.items()}}
-        _print_table("CONFIDENCE SIGNAL — SPEARMAN CORRELATION", [sp_row], "signal_pair")
+    # Table: Spearman
+    if all_spearman_rows:
+        _print_table("CONFIDENCE SIGNAL — SPEARMAN CORRELATION", all_spearman_rows, "retriever")
 
-    # Table 4: Generation metrics per model
+    # Table: Generation metrics
     gen_rows = []
     for model_id, scores in generation_results.items():
         row = {"model": model_id}
@@ -794,14 +958,17 @@ def main() -> None:
         gen_rows.append(row)
     _print_table("GENERATION QUALITY PER MODEL", gen_rows, "model")
 
+    # ── Comparison plot: all retrievers side-by-side ───────────────────────────
+    if len(retriever_ret_metrics) > 1:
+        print("\n  Generating retriever comparison plot...")
+        plot_retriever_comparison(retriever_ret_metrics, args.k_docs, args.output_dir)
+
     # ── Save CSVs ──────────────────────────────────────────────────────────────
     print(f"\n{'─'*60}")
     print("  Saving results...")
-
-    retr_expl_rows = [ret_row] + expl_rows
-    if spearman_result:
-        retr_expl_rows.append({"metric_group": "spearman_correlation", **{k: fmt(v) for k, v in spearman_result.items()}})
-    save_csv(os.path.join(args.output_dir, "retrieval_explanation_metrics.csv"), retr_expl_rows)
+    save_csv(os.path.join(args.output_dir, "retrieval_explanation_metrics.csv"), all_retr_expl_rows)
+    if all_spearman_rows:
+        save_csv(os.path.join(args.output_dir, "spearman_metrics.csv"), all_spearman_rows)
     save_csv(os.path.join(args.output_dir, "generation_metrics.csv"), gen_rows)
 
     print("\nEvaluation complete.")
