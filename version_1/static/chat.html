@@ -1,0 +1,1387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG-Ex Core - Chat Interface</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --primary-light: #a5b4fc;
+            --secondary: #8b5cf6;
+            --accent: #ec4899;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --danger: #ef4444;
+            --bg-light: #ffffff;
+            --bg-subtle: #f8fafc;
+            --bg-section: #f1f5f9;
+            --text-primary: #1e293b;
+            --text-secondary: #64748b;
+            --text-muted: #94a3b8;
+            --border: #e2e8f0;
+            --sidebar-width: 320px;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg-subtle);
+            color: var(--text-primary);
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #e0e7ff 0%, #ddd6fe 50%, #fce7f3 100%);
+            padding: 16px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(255, 255, 255, 0.5);
+            z-index: 0;
+        }
+
+        .header > * {
+            position: relative;
+            z-index: 1;
+        }
+
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .sidebar-toggle {
+            background: transparent;
+            border: 1px solid var(--border);
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            color: var(--text-primary);
+            transition: all 0.3s;
+        }
+
+        .sidebar-toggle:hover {
+            background: rgba(99, 102, 241, 0.1);
+            border-color: var(--primary);
+        }
+
+        .new-chat-btn {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .new-chat-btn:hover {
+            background: var(--primary-dark);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(99, 102, 241, 0.3);
+        }
+
+        .header-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status-badge {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Main Layout */
+        .main-layout {
+            display: flex;
+            height: calc(100vh - 65px);
+        }
+
+        /* Sidebar */
+        .sidebar {
+            width: var(--sidebar-width);
+            background: white;
+            border-right: 1px solid var(--border);
+            overflow-y: auto;
+            transition: transform 0.3s ease;
+            position: relative;
+            z-index: 10;
+        }
+
+        .sidebar.collapsed {
+            transform: translateX(calc(-1 * var(--sidebar-width)));
+        }
+
+        .sidebar-content {
+            padding: 20px;
+        }
+
+        .sidebar-section {
+            margin-bottom: 25px;
+        }
+
+        .sidebar-section h3 {
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            letter-spacing: 0.5px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        input[type="text"],
+        input[type="number"],
+        textarea,
+        select {
+            width: 100%;
+            padding: 10px 12px;
+            background: var(--bg-subtle);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            font-family: inherit;
+            transition: all 0.3s;
+        }
+
+        input:focus,
+        textarea:focus,
+        select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 10px;
+        }
+
+        input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+            accent-color: var(--primary);
+        }
+
+        /* Chat Area */
+        .chat-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: white;
+        }
+
+        .mode-tabs {
+            display: flex;
+            gap: 0;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-subtle);
+            padding: 0 20px;
+        }
+
+        .mode-tab {
+            padding: 12px 24px;
+            background: transparent;
+            border: none;
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            transition: all 0.3s;
+        }
+
+        .mode-tab:hover {
+            color: var(--primary);
+        }
+
+        .mode-tab.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+            background: white;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+            background: var(--bg-subtle);
+        }
+
+        .message {
+            margin-bottom: 25px;
+            animation: fadeIn 0.3s ease-in;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .message-user {
+            display: flex;
+            justify-content: flex-end;
+        }
+
+        .message-bubble {
+            max-width: 75%;
+            padding: 12px 18px;
+            border-radius: 12px;
+            line-height: 1.5;
+        }
+
+        .message-user .message-bubble {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            border-bottom-right-radius: 4px;
+        }
+
+        .message-assistant {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+        }
+
+        .message-assistant .message-bubble {
+            background: white;
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 4px;
+            max-width: 100%;
+        }
+
+        .message-header {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+
+        .answer-section {
+            margin-bottom: 20px;
+        }
+
+        .answer-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--primary);
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .answer-content {
+            background: var(--bg-subtle);
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 3px solid var(--primary);
+            line-height: 1.7;
+        }
+
+        .docs-grid {
+            display: grid;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .doc-item {
+            background: var(--bg-subtle);
+            padding: 12px;
+            border-radius: 6px;
+            border-left: 3px solid var(--secondary);
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .doc-item:hover {
+            transform: translateX(3px);
+            border-left-color: var(--primary);
+        }
+
+        .doc-score {
+            display: inline-block;
+            background: var(--primary);
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-bottom: 6px;
+        }
+
+        .importance-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 8px;
+            font-size: 0.85rem;
+        }
+
+        .importance-text {
+            flex: 1;
+        }
+
+        .importance-value {
+            font-weight: 600;
+            color: var(--primary);
+        }
+
+        .highlight-high {
+            background: #d1fae5;
+            color: #065f46;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        .highlight-medium {
+            background: #dbeafe;
+            color: #1e40af;
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-weight: 500;
+        }
+
+        .highlight-low {
+            background: #fce7f3;
+            color: #9f1239;
+            padding: 2px 5px;
+            border-radius: 4px;
+        }
+
+        /* Chat Input */
+        .chat-input-container {
+            padding: 20px;
+            background: white;
+            border-top: 1px solid var(--border);
+        }
+
+        .chat-input-wrapper {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+
+        .chat-input {
+            flex: 1;
+            padding: 12px 16px;
+            background: var(--bg-subtle);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-family: inherit;
+            resize: none;
+            min-height: 50px;
+            max-height: 150px;
+        }
+
+        .chat-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .send-button {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            min-width: 100px;
+        }
+
+        .send-button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+
+        .send-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        /* Typing dots animation */
+        .typing-indicator {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 16px 20px;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--text-muted);
+            animation: typing 1.4s infinite;
+        }
+
+        .typing-dot:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+
+        .typing-dot:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+
+        @keyframes typing {
+            0%, 60%, 100% {
+                transform: translateY(0);
+                opacity: 0.7;
+            }
+            30% {
+                transform: translateY(-10px);
+                opacity: 1;
+            }
+        }
+
+        .error-message {
+            background: #fee;
+            color: var(--danger);
+            padding: 12px 16px;
+            border-radius: 8px;
+            border-left: 3px solid var(--danger);
+            margin-top: 10px;
+        }
+
+        /* Low confidence warning */
+        .low-confidence-warning {
+            background: #fef3c7;
+            color: #92400e;
+            padding: 12px 16px;
+            border-radius: 8px;
+            border-left: 3px solid var(--warning);
+            margin-bottom: 15px;
+            font-size: 0.9rem;
+        }
+
+        /* Mobile responsive */
+        @media (max-width: 768px) {
+            .sidebar {
+                position: absolute;
+                height: 100%;
+                z-index: 100;
+            }
+
+            .message-bubble {
+                max-width: 90%;
+            }
+        }
+
+        /* Empty state */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100%;
+            color: var(--text-muted);
+            text-align: center;
+            padding: 40px;
+        }
+
+        .empty-state-icon {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            opacity: 0.3;
+        }
+
+        .empty-state-title {
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin-bottom: 10px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-subtitle {
+            font-size: 0.95rem;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <button class="sidebar-toggle" onclick="toggleSidebar()">☰</button>
+            <div class="header-title"> Explainable-RAG Interface</div>
+        </div>
+        <div class="header-right">
+            <button class="new-chat-btn" onclick="newChat()">
+                <span>🗨️</span>
+                <span>New Chat</span>
+            </button>
+            <div class="status-badge">
+                <span class="status-dot"></span>
+                <span id="statusText">Checking...</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Layout -->
+    <div class="main-layout">
+        <!-- Sidebar -->
+        <div class="sidebar" id="sidebar">
+            <div class="sidebar-content">
+                <!-- Explain Mode Settings -->
+                <div id="explainSettings" class="mode-settings">
+                    <div class="sidebar-section">
+                        <h3>Retrieval Settings</h3>
+                        <div class="form-group">
+                            <label for="retriever">Retriever</label>
+                            <select id="retriever">
+                                <option value="dense">Dense (Semantic)</option>
+                                <option value="bm25">BM25 (Keyword)</option>
+                                <option value="hybrid">Hybrid</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="topK">Top-K Documents</label>
+                            <input type="number" id="topK" value="3" min="1" max="10">
+                        </div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h3>Context Settings</h3>
+                        <div class="form-group">
+                            <label for="contextInput">Custom Context (Optional)</label>
+                            <textarea id="contextInput" rows="3" placeholder="Leave empty for RAG mode..."></textarea>
+                        </div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h3>Explanation Settings</h3>
+                        <div class="form-group">
+                            <label for="explainLevel">Explanation Level</label>
+                            <select id="explainLevel">
+                                <option value="word">Word</option>
+                                <option value="phrase">Phrase</option>
+                                <option value="sentence" selected>Sentence</option>
+                                <option value="paragraph">Paragraph</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="perturber">Perturber Strategy</label>
+                            <select id="perturber">
+                                <option value="leave_one_out">Leave One Out</option>
+                                <option value="random_noise">Random Noise</option>
+                                <option value="entity_perturber">Entity Perturber</option>
+                                <option value="antonym_perturber">Antonym Perturber</option>
+                                <option value="synonym_perturber">Synonym Perturber</option>
+                                <option value="reorder_perturber">Reorder Perturber</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="comparator">Comparator</label>
+                            <select id="comparator">
+                                <option value="semantic">Semantic Similarity</option>
+                                <option value="levenshtein">Levenshtein</option>
+                                <option value="jaro_winkler">Jaro Winkler</option>
+                                <option value="n_gram">N-Gram</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h3>Generation Settings</h3>
+                        <div class="form-group">
+                            <label for="maxLength">Max Generation Length</label>
+                            <input type="number" id="maxLength" value="256" min="50" max="500">
+                        </div>
+                        <div class="form-group">
+                            <label for="temperature">Temperature</label>
+                            <input type="number" id="temperature" value="0.0" min="0" max="2" step="0.1">
+                        </div>
+                        <div class="form-group">
+                            <label for="confidenceThreshold">Confidence Threshold</label>
+                            <input type="number" id="confidenceThreshold" value="0.6" min="0" max="1" step="0.1">
+                        </div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h3>Debug Options</h3>
+                        <div class="checkbox-group">
+                            <input type="checkbox" id="debug">
+                            <label for="debug" style="margin: 0;">Enable Debug Mode</label>
+                        </div>
+                        <div class="form-group" id="debugMaxGroup" style="display: none; margin-top: 10px;">
+                            <label for="debugMaxPerturbations">Max Perturbations to Show</label>
+                            <input type="number" id="debugMaxPerturbations" value="5" min="1" max="20">
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Compare Mode Settings -->
+                <div id="compareSettings" class="mode-settings" style="display: none;">
+                    <div class="sidebar-section">
+                        <h3>Fusion Method</h3>
+                        <div class="form-group">
+                            <label for="fusionMethod">Select Method</label>
+                            <select id="fusionMethod">
+                                <option value="baseline">Baseline (RAG-Ex)</option>
+                                <option value="multiplicative_gated_weighted_additive">Multiplicative Gated Weighted Additive</option>
+                                <option value="weighted_additive">Weighted Additive</option>
+                                <option value="triple_multiplicative">Triple Multiplicative</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h3>Retrieval Settings</h3>
+                        <div class="form-group">
+                            <label for="compareRetriever">Retriever</label>
+                            <select id="compareRetriever">
+                                <option value="dense">Dense (Semantic)</option>
+                                <option value="bm25">BM25 (Keyword)</option>
+                                <option value="hybrid">Hybrid</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="compareTopK">Top-K Documents</label>
+                            <input type="number" id="compareTopK" value="3" min="1" max="10">
+                        </div>
+                    </div>
+
+                    <div class="sidebar-section">
+                        <h3>Parameters</h3>
+                        <div class="form-group">
+                            <label for="fusionLambda">Fusion Lambda (λ)</label>
+                            <input type="number" id="fusionLambda" value="0.5" min="0" max="1" step="0.1">
+                        </div>
+                        <div class="form-group">
+                            <label for="compareMaxLength">Max Generation Length</label>
+                            <input type="number" id="compareMaxLength" value="100" min="50" max="500">
+                        </div>
+                        <div class="form-group">
+                            <label for="compareTemperature">Temperature</label>
+                            <input type="number" id="compareTemperature" value="0.0" min="0" max="2" step="0.1">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chat Container -->
+        <div class="chat-container">
+            <!-- Mode Tabs -->
+            <div class="mode-tabs">
+                <button class="mode-tab active" onclick="switchMode('explain')">🔍 Explain & RAG</button>
+                <button class="mode-tab" onclick="switchMode('compare')">⚖️ Compare Fusion</button>
+            </div>
+
+            <!-- Chat Messages -->
+            <div class="chat-messages" id="chatMessages">
+                <div class="empty-state">
+                    <div class="empty-state-icon">💬</div>
+                    <div class="empty-state-title">Start a Conversation</div>
+                    <div class="empty-state-subtitle">Ask a question to get started with explainable RAG</div>
+                </div>
+            </div>
+
+            <!-- Chat Input -->
+            <div class="chat-input-container">
+                <div class="chat-input-wrapper">
+                    <textarea 
+                        class="chat-input" 
+                        id="questionInput" 
+                        placeholder="Ask a question..."
+                        onkeydown="handleKeyPress(event)"
+                    ></textarea>
+                    <button class="send-button" id="sendButton" onclick="sendMessage()">
+                        Send
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = window.location.origin;
+        let currentMode = 'explain';
+        
+        // Separate chat histories and message counts for each mode
+        let explainChatHTML = null;
+        let compareChatHTML = null;
+        let explainMessageCount = 0;
+        let compareMessageCount = 0;
+        
+        // Separate loading states for each mode
+        let explainLoading = false;
+        let compareLoading = false;
+        
+        // Helper to get/set current mode's message count
+        function getMessageCount() {
+            return currentMode === 'explain' ? explainMessageCount : compareMessageCount;
+        }
+        
+        function setMessageCount(count) {
+            if (currentMode === 'explain') {
+                explainMessageCount = count;
+            } else {
+                compareMessageCount = count;
+            }
+        }
+        
+        // Helper to get/set current mode's loading state
+        function isLoading() {
+            return currentMode === 'explain' ? explainLoading : compareLoading;
+        }
+        
+        function setLoading(loading) {
+            if (currentMode === 'explain') {
+                explainLoading = loading;
+            } else {
+                compareLoading = loading;
+            }
+        }
+        
+        // Update send button state based on current mode's loading state
+        function updateSendButton() {
+            const sendButton = document.getElementById('sendButton');
+            if (isLoading()) {
+                sendButton.disabled = true;
+                sendButton.innerHTML = '<span class="loading"></span>Thinking...';
+            } else {
+                sendButton.disabled = false;
+                sendButton.innerHTML = 'Send';
+            }
+        }
+
+        // Check health on load
+        async function checkHealth() {
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                const statusText = document.getElementById('statusText');
+                
+                if (data.status === 'ok') {
+                    statusText.textContent = 'API Ready';
+                } else {
+                    statusText.textContent = 'API Not Ready';
+                }
+            } catch (error) {
+                document.getElementById('statusText').textContent = 'API Offline';
+            }
+        }
+
+        // Toggle Sidebar
+        function toggleSidebar() {
+            const sidebar = document.getElementById('sidebar');
+            sidebar.classList.toggle('collapsed');
+        }
+
+        // Switch Mode
+        function switchMode(mode) {
+            const chatMessages = document.getElementById('chatMessages');
+            
+            // Save current mode's chat state
+            if (currentMode === 'explain') {
+                explainChatHTML = chatMessages.innerHTML;
+            } else {
+                compareChatHTML = chatMessages.innerHTML;
+            }
+            
+            // Switch to new mode
+            currentMode = mode;
+            
+            // Update tabs
+            document.querySelectorAll('.mode-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            event.target.classList.add('active');
+
+            // Update sidebar settings
+            document.getElementById('explainSettings').style.display = mode === 'explain' ? 'block' : 'none';
+            document.getElementById('compareSettings').style.display = mode === 'compare' ? 'block' : 'none';
+            
+            // Restore new mode's chat state
+            const targetChatHTML = mode === 'explain' ? explainChatHTML : compareChatHTML;
+            const targetMessageCount = mode === 'explain' ? explainMessageCount : compareMessageCount;
+            
+            if (targetChatHTML === null || targetMessageCount === 0) {
+                // Show empty state for this mode
+                chatMessages.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">💬</div>
+                        <div class="empty-state-title">Start a Conversation</div>
+                        <div class="empty-state-subtitle">Ask a question to get started with ${mode === 'explain' ? 'explainable RAG' : 'fusion comparison'}</div>
+                    </div>
+                `;
+            } else {
+                // Restore saved chat history
+                chatMessages.innerHTML = targetChatHTML;
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }
+            
+            // Update send button state based on new mode's loading state
+            updateSendButton();
+        }
+
+        // Clear chat and start new conversation for current mode only
+        function newChat() {
+            const chatMessages = document.getElementById('chatMessages');
+            chatMessages.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">💬</div>
+                    <div class="empty-state-title">Start a Conversation</div>
+                    <div class="empty-state-subtitle">Ask a question to get started with ${currentMode === 'explain' ? 'explainable RAG' : 'fusion comparison'}</div>
+                </div>
+            `;
+            
+            // Clear current mode's history and count
+            if (currentMode === 'explain') {
+                explainChatHTML = null;
+                explainMessageCount = 0;
+            } else {
+                compareChatHTML = null;
+                compareMessageCount = 0;
+            }
+        }
+
+        // Handle Enter key in textarea
+        function handleKeyPress(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+
+        // Add message to chat
+        function addMessage(content, isUser = false, id = null) {
+            const chatMessages = document.getElementById('chatMessages');
+            
+            // Remove empty state if first message for this mode
+            if (getMessageCount() === 0) {
+                chatMessages.innerHTML = '';
+            }
+            setMessageCount(getMessageCount() + 1);
+
+            const messageDiv = document.createElement('div');
+            messageDiv.className = isUser ? 'message message-user' : 'message message-assistant';
+            if (id) messageDiv.id = id;
+            
+            if (isUser) {
+                messageDiv.innerHTML = `
+                    <div class="message-bubble">${escapeHtml(content)}</div>
+                `;
+            } else {
+                messageDiv.innerHTML = `
+                    <div class="message-header">Assistant</div>
+                    <div class="message-bubble">${content}</div>
+                `;
+            }
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            
+            // Auto-save current mode's chat state
+            if (currentMode === 'explain') {
+                explainChatHTML = chatMessages.innerHTML;
+            } else {
+                compareChatHTML = chatMessages.innerHTML;
+            }
+            
+            return messageDiv;
+        }
+
+        // Add typing indicator
+        function addTypingIndicator() {
+            const chatMessages = document.getElementById('chatMessages');
+            const typingDiv = document.createElement('div');
+            typingDiv.className = 'message message-assistant';
+            typingDiv.id = 'typing-indicator';
+            typingDiv.innerHTML = `
+                <div class="message-header">Assistant</div>
+                <div class="message-bubble">
+                    <div class="typing-indicator">
+                        <div class="typing-dot"></div>
+                        <div class="typing-dot"></div>
+                        <div class="typing-dot"></div>
+                    </div>
+                </div>
+            `;
+            chatMessages.appendChild(typingDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+
+        // Remove typing indicator
+        function removeTypingIndicator() {
+            const typingIndicator = document.getElementById('typing-indicator');
+            if (typingIndicator) {
+                typingIndicator.remove();
+                
+                // Save chat state after removing typing indicator
+                const chatMessages = document.getElementById('chatMessages');
+                if (currentMode === 'explain') {
+                    explainChatHTML = chatMessages.innerHTML;
+                } else {
+                    compareChatHTML = chatMessages.innerHTML;
+                }
+            }
+        }
+
+        // Send Message
+        async function sendMessage() {
+            const questionInput = document.getElementById('questionInput');
+            const question = questionInput.value.trim();
+            
+            if (!question) return;
+            
+            // Check if already processing for current mode
+            if (isLoading()) return;
+
+            // Add user message
+            addMessage(question, true);
+            questionInput.value = '';
+
+            // Add typing indicator
+            addTypingIndicator();
+
+            // Set loading state for current mode
+            setLoading(true);
+            updateSendButton();
+
+            try {
+                if (currentMode === 'explain') {
+                    await handleExplainRequest(question);
+                } else {
+                    await handleCompareRequest(question);
+                }
+            } catch (error) {
+                console.error('Request failed:', error);
+                removeTypingIndicator();
+                addMessage(`<div class="error-message">❌ ${error.message}</div>`);
+            } finally {
+                setLoading(false);
+                updateSendButton();
+            }
+        }
+
+        // Handle Explain Request
+        async function handleExplainRequest(question) {
+            const debugEnabled = document.getElementById('debug').checked;
+            
+            const payload = {
+                question: question,
+                context: document.getElementById('contextInput').value || "",
+                retriever: document.getElementById('retriever').value,
+                top_k_docs: parseInt(document.getElementById('topK').value),
+                explanation_level: document.getElementById('explainLevel').value,
+                perturber: document.getElementById('perturber').value,
+                comparator: document.getElementById('comparator').value,
+                max_length: parseInt(document.getElementById('maxLength').value),
+                temperature: parseFloat(document.getElementById('temperature').value),
+                confidence_threshold: parseFloat(document.getElementById('confidenceThreshold').value),
+                debug: debugEnabled,
+                debug_max_perturbations: debugEnabled ? parseInt(document.getElementById('debugMaxPerturbations').value) : 5
+            };
+
+            console.log('Explain Request Payload:', payload);
+
+            const response = await fetch(`${API_BASE}/explain`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => null);
+                const errorMsg = errorData?.detail || response.statusText;
+                throw new Error(`HTTP ${response.status}: ${errorMsg}`);
+            }
+
+            const data = await response.json();
+            displayExplainResult(data);
+        }
+
+        // Handle Compare Request
+        async function handleCompareRequest(question) {
+            const fusionMethod = document.getElementById('fusionMethod').value;
+            
+            // Build fusion_methods array based on selection
+            let fusionMethods;
+            if (fusionMethod === 'baseline') {
+                // For baseline, use empty array or all methods to compare
+                fusionMethods = [
+                    "multiplicative_gated_weighted_additive",
+                    "weighted_additive",
+                    "triple_multiplicative"
+                ];
+            } else {
+                // For specific method, just use that one
+                fusionMethods = [fusionMethod];
+            }
+            
+            const payload = {
+                question: question,
+                context: "",
+                retriever: document.getElementById('compareRetriever').value,
+                top_k_docs: parseInt(document.getElementById('compareTopK').value),
+                fusion_methods: fusionMethods,
+                fusion_lambda: parseFloat(document.getElementById('fusionLambda').value),
+                max_length: parseInt(document.getElementById('compareMaxLength').value),
+                temperature: parseFloat(document.getElementById('compareTemperature').value),
+                explanation_level: "sentence",
+                perturber: "leave_one_out",
+                comparator: "semantic",
+                confidence_threshold: 0.6,
+                debug: false,
+                debug_max_perturbations: 5
+            };
+
+            console.log('Compare Request Payload:', payload);
+
+            const response = await fetch(`${API_BASE}/compare`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => null);
+                const errorMsg = errorData?.detail || response.statusText;
+                throw new Error(`HTTP ${response.status}: ${errorMsg}`);
+            }
+
+            const data = await response.json();
+            displayCompareResult(data, fusionMethod);
+        }
+
+        // Display Explain Result
+        function displayExplainResult(data) {
+            let html = '';
+
+            // Check if answer indicates low confidence (by flag or content)
+            const isLowConfidence = data.low_confidence || 
+                                   (data.original_answer && data.original_answer.toLowerCase().includes('not confident'));
+
+            // Low confidence warning
+            if (data.low_confidence) {
+                html += `
+                    <div class="low-confidence-warning">
+                        ⚠️ <strong>Low Confidence Response:</strong> The retrieved documents may not be relevant enough. Confidence score: ${(data.retrieval_confidence || 0).toFixed(3)}
+                    </div>
+                `;
+            }
+
+            // Answer
+            html += `
+                <div class="answer-section">
+                    <div class="answer-title">📝 Answer</div>
+                    <div class="answer-content">${escapeHtml(data.original_answer)}</div>
+                </div>
+            `;
+
+            // If low confidence, only show answer and stop here
+            if (isLowConfidence) {
+                removeTypingIndicator();
+                addMessage(html);
+                return;
+            }
+
+            // Retrieved Documents with Relevance Scores
+            if (data.retrieved_docs && data.retrieved_docs.length > 0) {
+                html += `
+                    <div class="answer-section">
+                        <div class="answer-title">📚 Retrieved Documents (${data.retrieved_docs.length} docs)</div>
+                        <div class="docs-grid">
+                `;
+                data.retrieved_docs.forEach((item, idx) => {
+                    // API returns {doc: {...}, score: number}
+                    const docObj = item.doc || item;
+                    const docText = docObj.text || docObj.content || docObj.document || JSON.stringify(docObj);
+                    const score = item.score || 0;
+                    html += `
+                        <div class="doc-item">
+                            <div class="doc-score">Relevance Score: ${score.toFixed(4)}</div>
+                            <div style="margin-top: 8px; line-height: 1.6;">${escapeHtml(docText)}</div>
+                        </div>
+                    `;
+                });
+                html += `</div></div>`;
+            }
+
+            // All Importance Scores (only if not low confidence)
+            if (!data.low_confidence && data.token_importances && Object.keys(data.token_importances).length > 0) {
+                const importances = Object.entries(data.token_importances)
+                    .sort((a, b) => b[1] - a[1]);
+                
+                const totalTokens = importances.length;
+                const highThreshold = Math.ceil(totalTokens * 0.15);
+                const lowThreshold = Math.ceil(totalTokens * 0.85);
+
+                html += `
+                    <div class="answer-section">
+                        <div class="answer-title">⭐ Token Importance Scores (All ${totalTokens} tokens)</div>
+                        <div style="max-height: 300px; overflow-y: auto; padding-right: 10px;">
+                `;
+                importances.forEach(([token, score], idx) => {
+                    let badge = '';
+                    if (idx < highThreshold) {
+                        badge = '<span style="background: #d1fae5; color: #065f46; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; font-weight: 600; margin-left: 8px;">HIGH</span>';
+                    } else if (idx >= lowThreshold) {
+                        badge = '<span style="background: #fce7f3; color: #9f1239; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; font-weight: 600; margin-left: 8px;">LOW</span>';
+                    }
+                    html += `
+                        <div class="importance-item">
+                            <div class="importance-text">${escapeHtml(token)}${badge}</div>
+                            <div class="importance-value">${score.toFixed(4)}</div>
+                        </div>
+                    `;
+                });
+                html += `</div></div>`;
+            }
+
+            // Context Used with highlighting (only if not low confidence)
+            if (!data.low_confidence && data.context_used && data.token_importances) {
+                const highlighted = highlightContext(data.context_used, data.token_importances, 15);
+                html += `
+                    <div class="answer-section">
+                        <div class="answer-title">📄 Context Used (Top 15% highlighted)</div>
+                        <div style="margin-bottom: 12px; font-size: 0.85rem; color: var(--text-secondary);">
+                            <span class="highlight-high" style="display: inline-block; margin-right: 12px;">Most Important</span>
+                            <span class="highlight-medium" style="display: inline-block; margin-right: 12px;">Important</span>
+                            <span class="highlight-low" style="display: inline-block;">Least Important</span>
+                        </div>
+                        <div class="answer-content" style="line-height: 1.8;">${highlighted}</div>
+                    </div>
+                `;
+            }
+
+            removeTypingIndicator();
+            addMessage(html);
+        }
+
+        // Display Compare Result
+        function displayCompareResult(data, fusionMethod) {
+            let html = '';
+
+            const methodDisplayName = fusionMethod === 'baseline' 
+                ? 'Baseline (RAG-Ex)' 
+                : fusionMethod.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+
+            html += `
+                <div class="answer-section">
+                    <div class="answer-title">⚖️ Fusion Method: ${methodDisplayName}</div>
+                    <div class="answer-content">${escapeHtml(data.answer)}</div>
+                </div>
+            `;
+
+            // Retrieved Documents with Relevance Scores
+            if (data.retrieved_docs && data.retrieved_docs.length > 0) {
+                html += `
+                    <div class="answer-section">
+                        <div class="answer-title">📚 Retrieved Documents (${data.retrieved_docs.length} docs)</div>
+                        <div class="docs-grid">
+                `;
+                data.retrieved_docs.forEach((item, idx) => {
+                    // API returns {doc: {...}, score: number}
+                    const docObj = item.doc || item;
+                    const docText = docObj.text || docObj.content || docObj.document || JSON.stringify(docObj);
+                    const score = item.score || 0;
+                    html += `
+                        <div class="doc-item">
+                            <div class="doc-score">Relevance Score: ${score.toFixed(4)}</div>
+                            <div style="margin-top: 8px; line-height: 1.6;">${escapeHtml(docText)}</div>
+                        </div>
+                    `;
+                });
+                html += `</div></div>`;
+            }
+
+            // All Importance Scores
+            const methodKey = fusionMethod === 'baseline' ? 'baseline' : fusionMethod;
+            if (data.importance_scores && data.importance_scores[methodKey]) {
+                const importances = Object.entries(data.importance_scores[methodKey])
+                    .sort((a, b) => b[1] - a[1]);
+                
+                const totalTokens = importances.length;
+                const highThreshold = Math.ceil(totalTokens * 0.15);
+                const lowThreshold = Math.ceil(totalTokens * 0.85);
+
+                html += `
+                    <div class="answer-section">
+                        <div class="answer-title">⭐ Token Importance Scores (All ${totalTokens} tokens)</div>
+                        <div style="max-height: 300px; overflow-y: auto; padding-right: 10px;">
+                `;
+                importances.forEach(([token, score], idx) => {
+                    let badge = '';
+                    if (idx < highThreshold) {
+                        badge = '<span style="background: #d1fae5; color: #065f46; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; font-weight: 600; margin-left: 8px;">HIGH</span>';
+                    } else if (idx >= lowThreshold) {
+                        badge = '<span style="background: #fce7f3; color: #9f1239; padding: 2px 6px; border-radius: 3px; font-size: 0.75rem; font-weight: 600; margin-left: 8px;">LOW</span>';
+                    }
+                    html += `
+                        <div class="importance-item">
+                            <div class="importance-text">${escapeHtml(token)}${badge}</div>
+                            <div class="importance-value">${score.toFixed(4)}</div>
+                        </div>
+                    `;
+                });
+                html += `</div></div>`;
+            }
+
+            removeTypingIndicator();
+            addMessage(html);
+        }
+
+        // Highlight context with importance scores
+        function highlightContext(context, importances, topPercentage) {
+            if (!importances || Object.keys(importances).length === 0) {
+                return escapeHtml(context);
+            }
+
+            // Sort units by importance score
+            const sortedUnits = Object.entries(importances).sort((a, b) => b[1] - a[1]);
+            
+            if (sortedUnits.length === 0) {
+                return escapeHtml(context);
+            }
+
+            // Calculate thresholds based on percentage
+            const totalUnits = sortedUnits.length;
+            const highThreshold = Math.max(1, Math.ceil((totalUnits * topPercentage) / 100));
+            const remainingUnits = totalUnits - highThreshold;
+            const mediumThreshold = highThreshold + Math.ceil(remainingUnits / 2);
+
+            const categoryMap = {};
+            sortedUnits.forEach(([unit, score], index) => {
+                if (index < highThreshold) {
+                    categoryMap[unit] = 'high';
+                } else if (index < mediumThreshold) {
+                    categoryMap[unit] = 'medium';
+                } else {
+                    categoryMap[unit] = 'low';
+                }
+            });
+
+            // Create a working copy of context
+            let highlightedContext = context;
+            
+            // Sort units by length (longest first) to avoid partial replacements
+            const unitsByLength = Object.keys(categoryMap).sort((a, b) => b.length - a.length);
+            
+            // Replace each unit with highlighted version
+            unitsByLength.forEach(unit => {
+                const category = categoryMap[unit];
+                const escapedUnit = escapeHtml(unit);
+                const highlightClass = `highlight-${category}`;
+                const highlighted = `<span class="${highlightClass}">${escapedUnit}</span>`;
+                
+                // Escape the unit for use in regex
+                const escapedForRegex = unit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(escapedForRegex, 'g');
+                
+                highlightedContext = highlightedContext.replace(regex, highlighted);
+            });
+
+            return highlightedContext;
+        }
+
+        // Utility function to escape HTML
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Initialize
+        checkHealth();
+        setInterval(checkHealth, 30000);
+        
+        // Toggle debug max perturbations field
+        document.getElementById('debug').addEventListener('change', function() {
+            document.getElementById('debugMaxGroup').style.display = 
+                this.checked ? 'block' : 'none';
+        });
+    </script>
+</body>
+</html>

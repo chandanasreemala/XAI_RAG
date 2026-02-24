@@ -27,6 +27,12 @@ data/trivia/trivia_answers.jsonl
 data/halubench/halubench_docs.jsonl
 data/halubench/halubench_answers.jsonl
 data/docs.jsonl
+version_1/data/docs.jsonl
+version_1/data/halubench/halubench_docs.jsonl
+version_1/data/halubench/halubench_answers.jsonl
+version_1/data/hotpot/hotpot_docs.jsonl
+version_1/data/hotpot/hotpot_answers.jsonl
+version_1/data/hotpot/hotpotqa_fulldataset_cleaned.csv
 
 # Generated results
 results/
