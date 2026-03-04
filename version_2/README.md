@@ -1,6 +1,5 @@
 ## RAG-Ex v2 — Quick start
 
-Minimal steps for colleagues to run and experiment.
 
 1. Create `.env` with your Hugging Face token and models:
 
@@ -47,5 +46,6 @@ Notes:
 - Use `retriever` = `dense`, `bm25`, or `hybrid`.
 - `perturber` options: `leave_one_out`, `random_noise`, `entity_perturber`, `antonym_perturber`, `synonym_perturber`, `reorder_perturber`.
 - `comparator` options: `levenshtein`, `jaro_winkler`, `n_gram`, `semantic`.
-
+- "importance_mode": "modified_ragex", "ragex_core" aplha value: 0-1
+- "k-values": "top-1", "top-3", "top-20%"
 
