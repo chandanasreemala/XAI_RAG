@@ -6,6 +6,16 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"  # suppress sequential-GPU advisory
+
+import warnings
+warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
+warnings.filterwarnings("ignore", message=".*sequentially on GPU.*")
+
+# Suppress HuggingFace logging-based advisories (these use logging, not warnings)
+import logging as _std_logging
+_std_logging.getLogger("transformers.tokenization_utils_base").setLevel(_std_logging.ERROR)
+_std_logging.getLogger("transformers.pipelines.base").setLevel(_std_logging.ERROR)
 
 """
 RAG-Ex Core API
@@ -49,6 +59,33 @@ AVAILABLE_MODELS = [
     {"id": "Qwen/Qwen3-14B",                           "label": "Qwen3-14B"},
 ]
 
+# ---------------------------------------------------------------------------
+# Dataset configurations — maps dataset key -> file paths
+# ---------------------------------------------------------------------------
+DATASET_CONFIGS: Dict[str, Dict[str, str]] = {
+    "hotpot": {
+        "DOCUMENTS_PATH":  "data/hotpot/hotpot_docs.jsonl",
+        "FAISS_INDEX_PATH": "data/hotpot/hotpot_faiss.index",
+        "BM25_INDEX_PATH":  "data/hotpot/hotpot_bm25.pkl",
+        "label":           "HotpotQA",
+    },
+    "trivia": {
+        "DOCUMENTS_PATH":  "data/trivia/trivia_docs.jsonl",
+        "FAISS_INDEX_PATH": "data/trivia/trivia_faiss.index",
+        "BM25_INDEX_PATH":  "data/trivia/trivia_bm25.pkl",
+        "label":           "TriviaQA (Wikipedia)",
+    },
+}
+
+# Infer the active dataset from the current settings path at import time
+def _infer_active_dataset() -> str:
+    for key, cfg in DATASET_CONFIGS.items():
+        if cfg["DOCUMENTS_PATH"] in settings.DOCUMENTS_PATH:
+            return key
+    return list(DATASET_CONFIGS.keys())[0]
+
+_ACTIVE_DATASET: str = _infer_active_dataset()
+
 # Lazy cache: model_name -> GeneratorWrapper (loaded on first request)
 _GENERATOR_CACHE: Dict[str, GeneratorWrapper] = {}
 _GENERATOR_CACHE_LOCK = __import__("threading").Lock()
@@ -69,7 +106,7 @@ from app.comparator import COMPARATORS
 logger = logging.getLogger("uvicorn.error")
 
 # ---------------------------------------------------------------------------
-# Gold-data cache (built once at startup from hotpot JSONL files)
+# Gold-data cache (built once at startup, and refreshed on dataset switch)
 # ---------------------------------------------------------------------------
 _GOLD_ANSWERS: Optional[Dict[str, str]] = None        # question_id -> answer
 _GOLD_DOCS: Optional[Dict[str, List[str]]] = None     # base_id     -> [relevant_doc_ids]
@@ -82,13 +119,16 @@ def _norm_question(q: str) -> str:
     return " ".join(q.lower().split())
 
 
-def _build_hotpot_cache() -> None:
-    """Load hotpot_answers.jsonl and hotpot_docs.jsonl into in-memory dicts."""
+def _build_answer_cache() -> None:
+    """Load *_answers.jsonl and *_docs.jsonl for the active dataset into in-memory dicts."""
     global _GOLD_ANSWERS, _GOLD_DOCS, _GOLD_DOC_TEXTS, _GOLD_QUESTION_LOOKUP
 
-    docs_dir = os.path.dirname(os.path.abspath(settings.DOCUMENTS_PATH))
-    answers_path = os.path.join(docs_dir, "hotpot_answers.jsonl")
     docs_path = settings.DOCUMENTS_PATH
+    docs_dir  = os.path.dirname(os.path.abspath(docs_path))
+    basename  = os.path.basename(docs_path)
+    # Derive answers filename: replace trailing _docs.jsonl -> _answers.jsonl
+    answers_basename = basename.replace("_docs.jsonl", "_answers.jsonl")
+    answers_path = os.path.join(docs_dir, answers_basename)
 
     # --- answers + question-text reverse index ---
     _GOLD_ANSWERS = {}
@@ -115,7 +155,7 @@ def _build_hotpot_cache() -> None:
         logger.info("Gold answers loaded: %d entries, %d unique questions",
                     len(_GOLD_ANSWERS), len(_GOLD_QUESTION_LOOKUP))
     else:
-        logger.warning("hotpot_answers.jsonl not found at %s", answers_path)
+        logger.warning("Answers file not found at %s", answers_path)
 
     # --- docs (relevant = no '_irr_' in id) ---
     _GOLD_DOCS = {}       # base_id -> [doc_ids that are relevant]
@@ -143,7 +183,7 @@ def _build_hotpot_cache() -> None:
         logger.info("Gold doc groups loaded: %d base-IDs, %d relevant docs",
                     len(_GOLD_DOCS), len(_GOLD_DOC_TEXTS))
     else:
-        logger.warning("hotpot_docs.jsonl not found at %s", docs_path)
+        logger.warning("Docs file not found at %s", docs_path)
 
 
 def _gold_info_for_question(
@@ -383,7 +423,7 @@ def startup_event():
     # Pre-load the default (smallest) model so the first request is fast.
     _get_generator_for_model(settings.HF_MODEL)
     logger.info("Default generator initialized: %s", settings.HF_MODEL)
-    _build_hotpot_cache()
+    _build_answer_cache()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -421,6 +461,66 @@ def list_models():
     }
 
 
+@app.get("/datasets")
+def list_datasets():
+    """Return the list of available datasets and which one is currently active."""
+    return {
+        "active": _ACTIVE_DATASET,
+        "active_label": DATASET_CONFIGS[_ACTIVE_DATASET]["label"],
+        "available": [
+            {"id": k, "label": v["label"]} for k, v in DATASET_CONFIGS.items()
+        ],
+    }
+
+
+class SwitchDatasetRequest(BaseModel):
+    dataset: str = Field(..., description="Dataset key, e.g. 'hotpot' or 'trivia'")
+
+
+@app.post("/switch-dataset")
+def switch_dataset(req: SwitchDatasetRequest):
+    """Switch the active dataset.  Mutates settings paths and rebuilds the gold cache."""
+    global _ACTIVE_DATASET
+    from app.retrievers import bm25 as _bm25_mod
+
+    key = req.dataset
+    if key not in DATASET_CONFIGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown dataset '{key}'. Available: {list(DATASET_CONFIGS.keys())}",
+        )
+
+    if key == _ACTIVE_DATASET:
+        return {
+            "active": _ACTIVE_DATASET,
+            "label": DATASET_CONFIGS[_ACTIVE_DATASET]["label"],
+            "changed": False,
+        }
+
+    cfg = DATASET_CONFIGS[key]
+    # Mutate settings so all retrievers pick up the new paths
+    settings.DOCUMENTS_PATH   = cfg["DOCUMENTS_PATH"]
+    settings.FAISS_INDEX_PATH = cfg["FAISS_INDEX_PATH"]
+    settings.BM25_INDEX_PATH  = cfg["BM25_INDEX_PATH"]
+
+    # Invalidate both in-memory retriever caches so they reload from the new indices
+    _bm25_mod.invalidate_cache()
+    from app.retrievers import dense_faiss as _faiss_mod
+    _faiss_mod.invalidate_cache()
+
+    # Rebuild the gold answer / doc cache for the new dataset
+    _build_answer_cache()
+
+    _ACTIVE_DATASET = key
+    logger.info("Dataset switched to '%s' (%s)", key, cfg["label"])
+
+    return {
+        "active": _ACTIVE_DATASET,
+        "label": cfg["label"],
+        "changed": True,
+    }
+
+
 # ----------------------------
 # API endpoints
 # ----------------------------
@@ -451,8 +551,89 @@ def api_retrieve(
 
 
 # ---------------------------------------------------------------------------
+# /retrieve/compare — run multiple retrievers side-by-side (Explorer)
+# ---------------------------------------------------------------------------
+
+class RetrieverCompareRequest(BaseModel):
+    question: str = Field(..., description="Query to retrieve for")
+    retrievers: List[str] = Field(
+        ["dense", "bm25", "hybrid", "multi_query"],
+        description="Which retrievers to compare",
+    )
+    top_k: int = Field(5, ge=1, le=20, description="Top-k per retriever")
+    model: Optional[str] = None
+
+
+class RetrieverCompareResponse(BaseModel):
+    question: str
+    results: Dict[str, Any]   # {retriever_name: {docs, queries_used?}}
+
+
+@app.post("/retrieve/compare", response_model=RetrieverCompareResponse)
+def retrieve_compare(req: RetrieverCompareRequest):
+    """
+    Run the same query through multiple retrievers and return results from each
+    so the UI can diff which documents were found, what scores they got, and
+    (for multi_query) which generated sub-queries were used.
+    """
+    model_id = (req.model or settings.HF_MODEL).strip()
+    gen = None
+    if "multi_query" in req.retrievers:
+        try:
+            gen = _get_generator_for_model(model_id)
+        except Exception:
+            pass  # multi_query will fall back to heuristic rewrites
+
+    output: Dict[str, Any] = {}
+    for rname in req.retrievers:
+        try:
+            kw: Dict[str, Any] = {"retriever": rname}
+            if rname == "multi_query" and gen is not None:
+                kw["generator"] = gen
+            docs = retrieve(req.question, req.top_k, **kw)  # type: ignore
+            # Extract queries_used from meta (attached by query_rewriter)
+            queries_used: Optional[List[str]] = None
+            for d in (docs or []):
+                if isinstance(d, dict):
+                    _meta = d.get("meta") or (d.get("doc") or {}).get("meta") or {}
+                    _qu = _meta.get("queries_used") if isinstance(_meta, dict) else None
+                    if _qu:
+                        queries_used = _qu
+                        break
+            output[rname] = {"docs": docs, "queries_used": queries_used}
+        except Exception as e:
+            output[rname] = {"error": str(e), "docs": [], "queries_used": None}
+
+    return RetrieverCompareResponse(question=req.question, results=output)
+
+
+# ---------------------------------------------------------------------------
 # Helpers for retrieval relevance weighting
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Context length management
+# ---------------------------------------------------------------------------
+# Maximum characters to keep from each retrieved document's text before joining
+# into the context prompt.  1 400 chars ≈ 350 tokens — safely below the 384-token
+# limit of SBERT/cross-encoders and leaves plenty of room for the question.
+_MAX_DOC_CHARS: int = 1400
+
+# Maximum number of explanation units to run the perturbation loop over.
+# TriviaQA passages can produce 40+ sentences; capping prevents multi-minute waits.
+_MAX_UNITS: int = 25
+
+
+def _cap_doc_text(text: str, max_chars: int = _MAX_DOC_CHARS) -> str:
+    """Return the first `max_chars` characters of a document's text.
+    Preserves whole words by snapping back to the last space before the cutoff.
+    """
+    if len(text) <= max_chars:
+        return text
+    # Try to end on a word boundary
+    cut = text.rfind(" ", 0, max_chars)
+    return text[:cut] if cut > 0 else text[:max_chars]
+
 
 def _softmax_retrieval_weights(retrieved_docs: List[Dict[str, Any]]) -> Dict[str, float]:
     """
@@ -484,37 +665,37 @@ def _softmax_retrieval_weights(retrieved_docs: List[Dict[str, Any]]) -> Dict[str
 #! -----> Check doc weights are ranked or not, if not find the max weighted doc and return the max weight for that unit ---Not Done
 
 
-def _unit_retrieval_weight(unit: str, doc_weights: Dict[str, float]) -> float:
-    """
-    Return the retrieval weight for the doc(s) containing `unit`.
-    - If the unit matches multiple docs, return the highest weight among them.
-    - If no doc contains the unit, fallback 1e-8
-      (best available signal) rather than a near-zero constant.
-    """
-    if not doc_weights:
-        return 1e-8
-
-    unit_norm = re.escape(unit.strip())
-    matched_weights = [
-        weight
-        for doc_text, weight in doc_weights.items()
-        if re.search(unit_norm, re.sub(r'\s+', ' ', doc_text))
-    ]
-
-    if matched_weights:
-        return max(matched_weights)
-
-    # No exact match — fall back to the max weight across all docs
-    return max(doc_weights.values())
-
-
-
 # def _unit_retrieval_weight(unit: str, doc_weights: Dict[str, float]) -> float:
+#     """
+#     Return the retrieval weight for the doc(s) containing `unit`.
+#     - If the unit matches multiple docs, return the highest weight among them.
+#     - If no doc contains the unit, fallback 1e-8
+#       (best available signal) rather than a near-zero constant.
+#     """
+#     if not doc_weights:
+#         return 1e-8
+
 #     unit_norm = re.escape(unit.strip())
-#     for doc_text, weight in doc_weights.items():
-#         if re.search(unit_norm, re.sub(r'\s+', ' ', doc_text)):
-#             return weight
-#     return 0.0 + 1e-8 # small constant to prevent zeroing out importance
+#     matched_weights = [
+#         weight
+#         for doc_text, weight in doc_weights.items()
+#         if re.search(unit_norm, re.sub(r'\s+', ' ', doc_text))
+#     ]
+
+#     if matched_weights:
+#         return max(matched_weights)
+
+#     # No exact match — fall back to the max weight across all docs
+#     return max(doc_weights.values())
+
+
+
+def _unit_retrieval_weight(unit: str, doc_weights: Dict[str, float]) -> float:
+    unit_norm = re.escape(unit.strip())
+    for doc_text, weight in doc_weights.items():
+        if re.search(unit_norm, re.sub(r'\s+', ' ', doc_text)):
+            return weight
+    return 0.0 + 1e-8 # small constant to prevent zeroing out importance
 
 # def _unit_retrieval_weight(
 #     unit: str,
@@ -566,7 +747,7 @@ def explain(req: ExplainRequest):
 
             context_used = "\n".join(
                 [
-                    item["doc"]["text"]
+                    _cap_doc_text(item["doc"]["text"])
                     for item in (retrieved_docs or [])
                     if isinstance(item, dict)
                     and "doc" in item
@@ -659,6 +840,13 @@ def explain(req: ExplainRequest):
     if not units:
         units = [context_used]
 
+    # Cap the number of units to avoid multi-minute waits on long TriviaQA passages.
+    if len(units) > _MAX_UNITS:
+        logger.info(
+            "Capping explanation units from %d to %d (MAX_UNITS)", len(units), _MAX_UNITS
+        )
+        units = units[:_MAX_UNITS]
+
     # ----------------------------
     # Perturbation loop
     # ----------------------------
@@ -721,11 +909,12 @@ def explain(req: ExplainRequest):
         mean_sim   = sum(sims) / max(1, len(sims))
         raw_dissim = 1.0 - mean_sim
         raw_dissimilarities[unit] = float(raw_dissim)
+        #! ----> Check if the confidence drop is calculated correctly.----Done
 
         # Confidence drop (confidence_retrieval_fusion): Δc_i = max(0, c0 - mean(c_i^(j)))
         if needs_confidence:
             mean_pert_conf  = sum(conf_vals) / max(1, len(conf_vals)) if conf_vals else c0
-            delta_c         = max(0.0, c0 - mean_pert_conf)
+            delta_c         = abs(c0 - mean_pert_conf)
             confidence_drops[unit] = float(delta_c)
 
         if req.debug:
@@ -761,6 +950,7 @@ def explain(req: ExplainRequest):
 
     # Intermediate scores kept for debug output
     _normed_our: Dict[str, float] = {}   # softmax(raw_dissimilarities) — used by retrieval_weighted
+    _raw_rw: Dict[str, float] = {}       # pre-softmax product: softmax(dissim) * retrieval_weight
     _raw_fusion: Dict[str, float] = {}   # pre-softmax fusion scores — used by confidence_retrieval_fusion
 
     if req.importance_mode == "ragex_core":
@@ -778,12 +968,13 @@ def explain(req: ExplainRequest):
         # Degrades gracefully to baseline when no retrieval scores exist.
         _normed_our = _softmax_normalise(raw_dissimilarities)
 
-        retrieval_weighted = {
+        # raw product: softmax(dissim) * retrieval_weight  (pre-normalization)
+        _raw_rw: Dict[str, float] = {
             unit: _normed_our[unit] * _unit_retrieval_weight(unit, doc_weights)
             for unit in units
         }
-        # normalized = _normalise(raw_retrieval_weighted)
-        normalized = retrieval_weighted
+        # apply softmax on the product so normalized_importance != computed_ret_weighted_score
+        normalized = _softmax_normalise(_raw_rw)
 
     else:
         # ── Confidence–retrieval fusion ────────────────────────────────────
@@ -796,11 +987,15 @@ def explain(req: ExplainRequest):
         # - Generation confidence drop (Δc_i): How much the model's confidence in its answer decreases when unit i is perturbed. Higher means more important.
         # The formula is:
         # w_i = normalise( [α·w'_i + (1−α)·Δc_i] · r̃_d(i) )
+        
+        # softmax-normalise dissim once outside the loop (used as gating signal)
+        _normed_dissim_fusion = _softmax_normalise(raw_dissimilarities)
         for unit in units:
-            dissim          = raw_dissimilarities.get(unit, 0.0)
+            dissim          = _normed_dissim_fusion.get(unit, 0.0)  # already softmax-normalised
             confidence_drop = confidence_drops.get(unit, 0.0)
             retrieval_rel   = _unit_retrieval_weight(unit, doc_weights)
-            _raw_fusion[unit] = (req.alpha * dissim + (1.0 - req.alpha) * confidence_drop) * retrieval_rel
+            #! modified fusion formula
+            _raw_fusion[unit] = (req.alpha * retrieval_rel + (1.0 - req.alpha) * confidence_drop) * dissim
         normalized = _softmax_normalise(_raw_fusion)
 
     if req.debug:
@@ -809,12 +1004,10 @@ def explain(req: ExplainRequest):
             if req.importance_mode in ("retrieval_weighted", "confidence_retrieval_fusion"):
                 info["retrieval_weight"] = _unit_retrieval_weight(unit, doc_weights)
             if req.importance_mode == "retrieval_weighted":
-                # computed_ret_weighted_score = softmax(dissim)[unit] * retrieval_weight
-                info["computed_ret_weighted_score"] = (
-                    _normed_our.get(unit, 0.0) * _unit_retrieval_weight(unit, doc_weights)
-                )
+                # computed_ret_weighted_score = softmax(dissim)[unit] * retrieval_weight  (pre-softmax of product)
+                info["computed_ret_weighted_score"] = _raw_rw.get(unit, 0.0)
             if req.importance_mode == "confidence_retrieval_fusion":
-                # computed_fusion_score = (α·dissim + (1−α)·conf_drop) · retrieval_weight  (pre-softmax)
+                # computed_fusion_score = (α·retrieval_weight + (1−α)·conf_drop) · softmax(dissim)  (pre-softmax)
                 info["computed_fusion_score"] = _raw_fusion.get(unit, 0.0)
         debug_details["_baseline"] = {
             "original_answer": original,
@@ -880,7 +1073,7 @@ def compare(req: CompareRequest):
             except TypeError:
                 retrieved_docs = retrieve(req.question, req.top_k_docs)  # type: ignore
             context_used = "\n".join([
-                item["doc"]["text"]
+                _cap_doc_text(item["doc"]["text"])
                 for item in (retrieved_docs or [])
                 if isinstance(item, dict) and "doc" in item and "text" in item["doc"]
             ]).strip()
@@ -920,6 +1113,11 @@ def compare(req: CompareRequest):
         raise HTTPException(status_code=400, detail=f"Invalid explanation_level: {e}") from e
     if not units:
         units = [context_used]
+
+    # Cap units to avoid extremely long perturbation loops on TriviaQA passages.
+    if len(units) > _MAX_UNITS:
+        logger.info("Capping compare units from %d to %d (MAX_UNITS)", len(units), _MAX_UNITS)
+        units = units[:_MAX_UNITS]
 
     # --- Single perturbation pass: collect raw_dissim + confidence_drop ------
     raw_dissimilarities: Dict[str, float] = {}
@@ -979,9 +1177,10 @@ def compare(req: CompareRequest):
     raw_rw = {u: normed_our[u] * _unit_retrieval_weight(u, doc_weights) for u in units}
     ret_weighted_imp = _softmax_normalise_cmp(raw_rw)
 
+    #! modified fusion formula
     raw_fusion = {
-        u: (req.alpha * raw_dissimilarities[u] + (1.0 - req.alpha) * confidence_drops[u])
-           * _unit_retrieval_weight(u, doc_weights)
+        u: (req.alpha * _unit_retrieval_weight(u, doc_weights) + (1.0 - req.alpha) * confidence_drops[u])
+           * normed_our[u]
         for u in units
     }
     fusion_imp = _softmax_normalise_cmp(raw_fusion)

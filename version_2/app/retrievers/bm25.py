@@ -4,7 +4,7 @@ import os
 import pickle
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from rank_bm25 import BM25Okapi
 from app.config import settings
@@ -20,6 +20,13 @@ class BM25Index:
     docs: List[Dict[str, Any]]
 
 _BM25_CACHE: BM25Index | None = None
+
+
+def invalidate_cache() -> None:
+    """Reset the in-memory BM25 index so the next retrieve() call reloads from disk.
+    Call this whenever the active dataset changes."""
+    global _BM25_CACHE
+    _BM25_CACHE = None
 
 def _load_docs_jsonl(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
@@ -38,7 +45,14 @@ def _load_docs_jsonl(path: str) -> List[Dict[str, Any]]:
         raise ValueError(f"No docs in {path}")
     return docs
 
-def build_index(docs_path: str = settings.DOCUMENTS_PATH, bm25_path: str = settings.BM25_INDEX_PATH) -> BM25Index:
+def build_index(
+    docs_path: Optional[str] = None,
+    bm25_path: Optional[str] = None,
+) -> BM25Index:
+    if docs_path is None:
+        docs_path = settings.DOCUMENTS_PATH
+    if bm25_path is None:
+        bm25_path = settings.BM25_INDEX_PATH
     docs = _load_docs_jsonl(docs_path)
     corpus = [_tokenize(d["text"]) for d in docs]
     bm25 = BM25Okapi(corpus)
@@ -48,7 +62,9 @@ def build_index(docs_path: str = settings.DOCUMENTS_PATH, bm25_path: str = setti
         pickle.dump(idx, f)
     return idx
 
-def load_index(bm25_path: str = settings.BM25_INDEX_PATH) -> BM25Index:
+def load_index(bm25_path: Optional[str] = None) -> BM25Index:
+    if bm25_path is None:
+        bm25_path = settings.BM25_INDEX_PATH
     if not os.path.exists(bm25_path):
         # try building from docs.jsonl automatically
         return build_index()
@@ -62,6 +78,18 @@ def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
 
     q = _tokenize(query)
     scores = _BM25_CACHE.bm25.get_scores(q)
-    top = sorted(range(len(scores)), key=lambda i: float(scores[i]), reverse=True)[:k]
+    # Fetch extra candidates so we can deduplicate and still return k results
+    top = sorted(range(len(scores)), key=lambda i: float(scores[i]), reverse=True)[:k * 4]
 
-    return [{"doc": _BM25_CACHE.docs[i], "score": float(scores[i])} for i in top]
+    results: List[Dict[str, Any]] = []
+    seen_texts: set = set()
+    for i in top:
+        text = _BM25_CACHE.docs[i].get("text", "")
+        norm = text.lower().strip()
+        if norm in seen_texts:
+            continue
+        seen_texts.add(norm)
+        results.append({"doc": _BM25_CACHE.docs[i], "score": float(scores[i])})
+        if len(results) == k:
+            break
+    return results

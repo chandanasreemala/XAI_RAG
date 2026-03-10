@@ -15,8 +15,8 @@ try:
         SBERT_MODEL: str = "sentence-transformers/all-mpnet-base-v2"
         EMBEDDING_MODEL: str = "sentence-transformers/all-mpnet-base-v2"
         RETRIEVER_DEFAULT: str = "dense"  # "dense" or "bm25"
-        BM25_INDEX_PATH: str = "data/hotpot/bm25.pkl"
-        FAISS_INDEX_PATH: str = "data/hotpot/faiss.index"
+        BM25_INDEX_PATH: str = "data/hotpot/hotpot_bm25.pkl"
+        FAISS_INDEX_PATH: str = "data/hotpot/hotpot_faiss.index"
         DOCUMENTS_PATH: str = "data/hotpot/hotpot_docs.jsonl"
 
         model_config = SettingsConfigDict(env_file=_ENV_FILE)
@@ -30,8 +30,8 @@ except ImportError:
         SBERT_MODEL: str = "sentence-transformers/all-mpnet-base-v2"
         EMBEDDING_MODEL: str = "sentence-transformers/all-mpnet-base-v2"
         RETRIEVER_DEFAULT: str = "dense"  # "dense" or "bm25"
-        BM25_INDEX_PATH: str = "data/hotpot/bm25.pkl"
-        FAISS_INDEX_PATH: str = "data/hotpot/faiss.index"
+        BM25_INDEX_PATH: str = "data/hotpot/hotpot_bm25.pkl"
+        FAISS_INDEX_PATH: str = "data/hotpot/hotpot_faiss.index"
         DOCUMENTS_PATH: str = "data/hotpot/hotpot_docs.jsonl"
 
         class Config:
