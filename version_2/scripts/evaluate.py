@@ -797,9 +797,11 @@ def _print_table(title: str, rows: List[Dict[str, Any]], key_col: str) -> None:
 def save_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     if not rows:
         return
+    # Union of all keys across all rows so mixed-schema rows don't raise
+    all_keys: List[str] = list(dict.fromkeys(k for row in rows for k in row.keys()))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=all_keys, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     print(f"  Saved: {path}")

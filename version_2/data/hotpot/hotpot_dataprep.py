@@ -44,6 +44,7 @@ def main():
          open(ANSWERS_OUTPUT, "w", encoding="utf-8") as f_ans:
 
         reader = csv.DictReader(f_in)
+        seen_texts: set = set()  # deduplicate by normalized text
 
         for row in reader:
             row_id = row["id"].strip()
@@ -60,6 +61,11 @@ def main():
 
             for item in passage_items:
                 item_normalized = normalize(item)
+
+                # Skip duplicate texts already written under a different id
+                if item_normalized in seen_texts:
+                    continue
+                seen_texts.add(item_normalized)
 
                 if item_normalized in gt_normalized:
                     doc_id = f"{row_id}_{rel_counter}"

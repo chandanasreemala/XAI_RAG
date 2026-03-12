@@ -16,4 +16,6 @@ if command -v conda >/dev/null 2>&1; then
   fi
 fi
 
-exec uvicorn app.api:app --reload --port "$PORT" --host 0.0.0.0
+# WATCHFILES_FORCE_POLLING bypasses inotify entirely (uses polling instead),
+# avoiding "OS file watch limit reached" on shared servers with low inotify limits.
+exec env WATCHFILES_FORCE_POLLING=true uvicorn app.api:app --reload --reload-dir app --port "$PORT" --host 0.0.0.0

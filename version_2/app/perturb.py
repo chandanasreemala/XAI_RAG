@@ -44,10 +44,15 @@ def split_context(text: str, level: str):
     if level == "paragraph":
         return [p.strip() for p in text.split("\n") if p.strip()]
 
-    # if level == "phrase":
-    #     # noun phrase chunks (linguistically meaningful)
-    #     doc = nlp(text)
-    #     return [chunk.text.strip() for chunk in doc.noun_chunks]
+    if level == "phrase":
+        # Use spaCy noun-chunks as linguistically meaningful phrases.
+        doc = nlp(text)
+        chunks = [chunk.text.strip() for chunk in doc.noun_chunks if chunk.text.strip()]
+        if chunks:
+            return chunks
+        # Fallback: non-overlapping 2-word windows when no noun chunks found.
+        words = text.split()
+        return [" ".join(words[i:i+2]) for i in range(0, len(words), 2) if words[i:i+2]]
 
     raise ValueError(f"Unknown explanation_level: {level}")
 

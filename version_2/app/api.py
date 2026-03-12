@@ -54,9 +54,13 @@ from app.retriever import retrieve
 # Available models — keep in sync with what your hardware can serve
 # ---------------------------------------------------------------------------
 AVAILABLE_MODELS = [
-    {"id": settings.HF_MODEL,                         "label": "Gemma 2b Instruct (default)"},
-    {"id": "meta-llama/Llama-3.1-8B-Instruct",        "label": "Llama 3.1 8B Instruct"},
-    {"id": "Qwen/Qwen3-14B",                           "label": "Qwen3-14B"},
+    {"id": "google/flan-t5-small",                          "label": "Flan-T5 Small (default, fast)"},
+    {"id": "google/gemma-2b-it",                           "label": "Gemma 2b Instruct"},
+    {"id": "meta-llama/Llama-3.1-8B-Instruct",             "label": "Llama 3.1 8B Instruct"},
+    # Qwen3-14B requires transformers >=4.51 and Python >=3.10.
+    # Uncomment when environment is upgraded:
+    # {"id": "Qwen/Qwen3-14B",                             "label": "Qwen3-14B (needs Python 3.10)"},
+    {"id": "Qwen/Qwen2.5-7B-Instruct",                    "label": "Qwen2.5 7B Instruct"},
 ]
 
 # ---------------------------------------------------------------------------
@@ -91,14 +95,73 @@ _GENERATOR_CACHE: Dict[str, GeneratorWrapper] = {}
 _GENERATOR_CACHE_LOCK = __import__("threading").Lock()
 
 
+def _make_qa_prompt(gen: "GeneratorWrapper", context: str, question: str) -> str:
+    """
+    Build the right prompt format for the loaded model.
+
+    Strategy for causal instruct models:
+      1. Try apply_chat_template with a system + user message (Llama, Qwen).
+      2. If the model rejects the system role (e.g. Gemma), retry with the
+         instruction merged into the user message.
+      3. If apply_chat_template fails entirely, fall back to raw format.
+    """
+    tokenizer = gen.tokenizer
+    is_causal = getattr(gen, "is_causal", False)
+    has_chat = (
+        is_causal
+        and hasattr(tokenizer, "apply_chat_template")
+        and getattr(tokenizer, "chat_template", None) is not None
+    )
+    SYSTEM_INSTRUCTION = (
+        "You are a precise question-answering assistant. "
+        "Answer the question using only the provided context. "
+        "Give the shortest possible direct answer — "
+        "ideally 1-5 words, never more than one sentence."
+    )
+    if has_chat:
+        # Attempt 1: system + user (works for Llama, Qwen)
+        try:
+            messages = [
+                {"role": "system", "content": SYSTEM_INSTRUCTION},
+                {"role": "user",   "content": f"Context: {context}\n\nQuestion: {question}"},
+            ]
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            pass
+        # Attempt 2: merge instruction into user message (works for Gemma-it)
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{SYSTEM_INSTRUCTION}\n\n"
+                        f"Context: {context}\n\nQuestion: {question}"
+                    ),
+                }
+            ]
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as e:
+            logger.warning(
+                "_make_qa_prompt: apply_chat_template failed (%s), using raw format.", e
+            )
+    return f"Context: {context}\nQuestion: {question}\nAnswer:"
+
+
+
 def _get_generator_for_model(model_name: str) -> GeneratorWrapper:
-    """Return a cached GeneratorWrapper, loading it the first time it is requested."""
-    if model_name not in _GENERATOR_CACHE:
-        with _GENERATOR_CACHE_LOCK:
-            if model_name not in _GENERATOR_CACHE:  # double-checked locking
-                logger.info("Loading generator for model: %s", model_name)
-                _GENERATOR_CACHE[model_name] = get_generator(model_name)
-                logger.info("Generator loaded: %s", model_name)
+    """Return a cached GeneratorWrapper, loading it the first time it is requested.
+    Evicts any stale cache entry that is missing methods added in a hot-reload
+    (e.g. make_qa_prompt) so uvicorn --reload never serves old objects.
+    """
+    with _GENERATOR_CACHE_LOCK:
+        if model_name not in _GENERATOR_CACHE:
+            logger.info("Loading generator for model: %s", model_name)
+            _GENERATOR_CACHE[model_name] = get_generator(model_name)
+            logger.info("Generator loaded: %s", model_name)
     return _GENERATOR_CACHE[model_name]
 from app.perturb import perturb_sentence, split_context
 from app.comparator import COMPARATORS
@@ -400,6 +463,20 @@ class CompareRequest(BaseModel):
     model: Optional[str] = None
 
 
+class CounterfactualResult(BaseModel):
+    """Result of a single counterfactual re-ranking probe."""
+    # 'already_correct' | 'rank_matters' | 'retriever_failure'
+    diagnosis: str
+    # 1-indexed rank of the retrieved doc that contained the gold answer (None = not found)
+    gold_found_in_doc_rank: Optional[int] = None
+    gold_doc_score: Optional[float] = None
+    # Answer produced after boosting the gold doc to rank #1
+    counterfactual_answer: Optional[str] = None
+    counterfactual_matches_gold: Optional[bool] = None
+    counterfactual_similarity: Optional[float] = None
+    original_similarity: Optional[float] = None
+
+
 class CompareResponse(BaseModel):
     context_used: str
     prompt: str
@@ -413,6 +490,7 @@ class CompareResponse(BaseModel):
     retriever_recall: Optional[float] = None
     alpha: float
     units: List[UnitSignals]
+    counterfactual: Optional[CounterfactualResult] = None
 
 
 # ----------------------------
@@ -817,7 +895,7 @@ def explain(req: ExplainRequest):
     # ----------------------------
     # Baseline generation
     # ----------------------------
-    prompt = f"Context: {context_used}\nQuestion: {req.question}\nAnswer:"
+    prompt = _make_qa_prompt(gen, context_used, req.question)
 
     if needs_confidence:
         original, c0 = generate_answer(
@@ -877,7 +955,7 @@ def explain(req: ExplainRequest):
                 new_units[i] = p
                 new_ctx = " ".join([u for u in new_units if u is not None])
 
-            new_prompt = f"Context: {new_ctx}\nQuestion: {req.question}\nAnswer:"
+            new_prompt = _make_qa_prompt(gen, new_ctx, req.question)
 
             if needs_confidence:
                 # confidence_retrieval_fusion: collect generation confidence alongside answer
@@ -955,8 +1033,10 @@ def explain(req: ExplainRequest):
 
     if req.importance_mode == "ragex_core":
         # ── Perturbation-based generator importance (baseline) ────────────
-        # w_i = w'_i / max_j w'_j
+        # Use softmax (same scale as RW and Fusion) so delta comparisons are meaningful.
+        # w_i = w'_i/max(w'_i)
         normalized = _normalise(raw_dissimilarities)
+        # normalized = _softmax_normalise(raw_dissimilarities)
 
     #! --------> Change the normalisation to softmax in both ret weighted and fusion.----Done
 
@@ -1100,7 +1180,7 @@ def compare(req: CompareRequest):
     doc_weights = _softmax_retrieval_weights(retrieved_docs or [])
 
     # --- Baseline generation (always collect confidence for fusion) ----------
-    prompt = f"Context: {context_used}\nQuestion: {req.question}\nAnswer:"
+    prompt = _make_qa_prompt(gen, context_used, req.question)
     original, c0 = generate_answer(
         gen, prompt, max_length=req.max_length, temperature=req.temperature, return_confidence=True
     )
@@ -1141,7 +1221,7 @@ def compare(req: CompareRequest):
                 new_units = units.copy()
                 new_units[i] = p
                 new_ctx = " ".join([u for u in new_units if u is not None])
-            new_prompt = f"Context: {new_ctx}\nQuestion: {req.question}\nAnswer:"
+            new_prompt = _make_qa_prompt(gen, new_ctx, req.question)
             pert_answer, pert_conf = generate_answer(
                 gen, new_prompt, max_length=req.max_length,
                 temperature=req.temperature, return_confidence=True,
@@ -1171,7 +1251,10 @@ def compare(req: CompareRequest):
         softmax_vals = torch_F.softmax(vals, dim=0)
         return {k: float(softmax_vals[i].item()) for i, k in enumerate(keys)}
 
+    # All three modes use softmax normalization so scores are on the same scale
+    # and the delta chart shows genuine differences, not a normalization artefact.
     baseline_imp = _normalise(raw_dissimilarities)
+    # baseline_imp = _softmax_normalise_cmp(raw_dissimilarities)
 
     normed_our = _softmax_normalise_cmp(raw_dissimilarities)
     raw_rw = {u: normed_our[u] * _unit_retrieval_weight(u, doc_weights) for u in units}
@@ -1211,6 +1294,72 @@ def compare(req: CompareRequest):
 
     gold = _gold_info_for_question(req.question, retrieved_docs)
 
+    # ── Counterfactual re-ranking experiment ─────────────────────────────────
+    # Logic:
+    #   1. If the original answer already matches gold → diagnosis = 'already_correct'
+    #   2. If wrong but gold text found in a retrieved doc → re-run generator with
+    #      that doc promoted to rank #1 → diagnosis = 'rank_matters'
+    #   3. If wrong and gold not found in any retrieved doc → diagnosis = 'retriever_failure'
+    counterfactual: Optional[CounterfactualResult] = None
+    gold_answer_text = gold.get("gold_answer")
+    if gold_answer_text and retrieved_docs:
+        gold_tokens = set(gold_answer_text.lower().split())
+
+        def _tok_overlap(text: str) -> float:
+            if not gold_tokens:
+                return 0.0
+            return len(gold_tokens & set(text.lower().split())) / len(gold_tokens)
+
+        orig_sim = _tok_overlap(original)
+
+        # Find the first retrieved doc that contains most of the gold answer tokens
+        gold_doc_rank: Optional[int] = None
+        gold_doc_score_cf: Optional[float] = None
+        for _rank_i, _item in enumerate(retrieved_docs):
+            if isinstance(_item, dict) and "doc" in _item:
+                if _tok_overlap(_item["doc"].get("text", "")) >= 0.5:
+                    gold_doc_rank = _rank_i + 1
+                    gold_doc_score_cf = float(_item.get("score", 0.0))
+                    break
+
+        if orig_sim >= 0.5:
+            counterfactual = CounterfactualResult(
+                diagnosis="already_correct",
+                gold_found_in_doc_rank=gold_doc_rank,
+                gold_doc_score=gold_doc_score_cf,
+                original_similarity=orig_sim,
+            )
+        elif gold_doc_rank is None:
+            counterfactual = CounterfactualResult(
+                diagnosis="retriever_failure",
+                original_similarity=orig_sim,
+            )
+        else:
+            # Re-rank: promote gold doc to position 0, keep rest in original order
+            _gidx = gold_doc_rank - 1
+            _reranked = [retrieved_docs[_gidx]] + [
+                itm for _i, itm in enumerate(retrieved_docs) if _i != _gidx
+            ]
+            _cf_ctx = "\n".join([
+                _cap_doc_text(itm["doc"]["text"])
+                for itm in _reranked
+                if isinstance(itm, dict) and "doc" in itm and "text" in itm["doc"]
+            ]).strip()
+            _cf_prompt = _make_qa_prompt(gen, _cf_ctx, req.question)
+            _cf_answer = generate_answer(
+                gen, _cf_prompt, max_length=req.max_length, temperature=req.temperature
+            )
+            _cf_sim = _tok_overlap(_cf_answer)
+            counterfactual = CounterfactualResult(
+                diagnosis="rank_matters",
+                gold_found_in_doc_rank=gold_doc_rank,
+                gold_doc_score=gold_doc_score_cf,
+                counterfactual_answer=_cf_answer,
+                counterfactual_matches_gold=_cf_sim >= 0.5,
+                counterfactual_similarity=_cf_sim,
+                original_similarity=orig_sim,
+            )
+
     return CompareResponse(
         context_used=context_used,
         prompt=prompt,
@@ -1224,4 +1373,5 @@ def compare(req: CompareRequest):
         retriever_recall=gold.get("retriever_recall"),
         alpha=req.alpha,
         units=unit_signals,
+        counterfactual=counterfactual,
     )

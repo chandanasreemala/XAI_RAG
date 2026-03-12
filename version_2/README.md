@@ -26,8 +26,16 @@ python -m scripts.build_index data/docs.jsonl
 5. Start API server:
 
 ```
-CUDA_VISIBLE_DEVICES=0 uvicorn app.api:app --reload --port 8000
+Cuda example (direct):
+CUDA_VISIBLE_DEVICES=1 uvicorn app.api:app --reload --port 8000 --host 0.0.0.0
+
+# Or, use the helper script (recommended):
+./run_server_v2.sh 8000
 ```
+
+
+
+> **Note:** `--host 0.0.0.0` binds to all network interfaces so colleagues on the same network can access the API at `http://<your-machine-IP>:8000`. Without it, the server is only reachable from localhost. Find your IP with `hostname -I`.
 
 6. Example request (POST `/explain`):
 
@@ -49,3 +57,54 @@ Notes:
 - "importance_mode": "modified_ragex", "ragex_core" aplha value: 0-1
 - "k-values": "top-1", "top-3", "top-20%"
 
+
+## Running v2 and v3 side-by-side (ports & shareable URLs)
+
+Start `version_2` on port 8000 and `version_3` on port 8001 so they don't conflict.
+
+```bash
+# version_2
+cd /home/csmala/XAI_RT_RAG/ragex_core_v2_main/version_2
+./run_server_v2.sh 8000
+
+OR 
+
+CUDA_VISIBLE_DEVICES=1 uvicorn app.api:app --reload --host 0.0.0.0 --port 8000
+CUDA_VISIBLE_DEVICES=1 WATCHFILES_FORCE_POLLING=true uvicorn app.api:app --reload --reload-dir app --port 8000 --host 0.0.0.0
+
+
+Shareable URLs for colleagues on the same LAN:
+
+Version 2:
+http://131.114.2.129:8000/static/index.html
+
+
+Find your local IP with:
+
+```bash
+hostname -I | awk '{print $1}'
+```
+
+To expose either server publicly, use a tunnel like `ngrok`:
+
+```bash
+ngrok http 8000   # share version_2
+```
+
+The `ngrok` command prints a public https URL you can give to remote colleagues.
+
+
+
+Demo: Gary Harrison, began his career in the 1970s and has written over how many major-label recorded songs including several number-one hits, another artist who have recorded his work include Bryan White, an American country music artist?
+
+Who is the American internet entrepreneur who founded the company featured on 24 Hours on Craigslist?
+
+\Okay some modifications, the order that you should show...the system health section as the first one, then the retrived documents vs relevant documents side by side comparision if short docs, if long docs top bottom. If the retriever retrived the relevant doc just add a gold with prize symbol short label on top of it. Because we are just saying retrieved ranked it at rank #1 #2 #3 etc but not showing the actual ret docs.
+Next we should show the units along with its scores of baseline, RW and F
+Then we should show the Hypothesis: Does the retriever surface the most important document? section. 
+Last we shouls show the Context Importance Map and then last key observations. 
+
+Remember there are some edge cases that u should consider: like while showing the context importance map, show them in order as they are retrieved, not inorder of the most important unit first. 
+
+Which American college that has sent students to Centre for Medieval and Renaissance Studies was founded in 1874?
+compare dense and hybrid - 5 docs, flant5, cop fusion
