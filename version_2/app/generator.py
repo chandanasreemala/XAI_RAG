@@ -1,26 +1,7 @@
-# from transformers import pipeline, AutoModelForSeq2SeqLM, AutoTokenizer
-# from app.config import settings
-# from typing import Optional
-# import os
-
-# HF_TOKEN = settings.HF_TOKEN
-# MODEL = settings.HF_MODEL
-
-# def get_generator(model_name: Optional[str]=None):
-#     model_name = model_name or MODEL
-#     tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HF_TOKEN)
-#     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, use_auth_token=HF_TOKEN)
-#     device = 0 if os.getenv("CUDA_AVAILABLE") else -1
-#     gen = pipeline("text2text-generation", model=model, tokenizer=tokenizer, device=device)
-#     return gen
-
-# def generate_answer(generator, prompt: str, max_length: int = 256, temperature: float = 0.0) -> str:
-#     out = generator(prompt, max_length=max_length, do_sample=False, temperature=temperature)
-#     return out[0].get("generated_text", "")
-
 from typing import Any, Dict, List, Optional, Tuple, Union
 import math
 import os
+import re
 
 import torch
 import torch.nn.functional as F
@@ -38,17 +19,52 @@ HF_TOKEN = settings.HF_TOKEN
 MODEL = settings.HF_MODEL
 
 
+def _safe_prompt(tokenizer, prompt: str, max_new_tokens: int) -> str:
+    """
+    Truncate `prompt` so that  len(input_tokens) + max_new_tokens  fits within
+    the model's maximum sequence length.
+
+    Keeps the LAST `budget` tokens so the question (always at the end of the
+    prompt) is preserved when the context must be cut.
+
+    Some HuggingFace tokenizers set model_max_length to sys.maxsize; we cap at
+    4096 in that case so we never build an absurdly large input tensor.
+    """
+    limit = getattr(tokenizer, "model_max_length", 512)
+    if limit > 1_000_000:   # guard against tokenizers that set this to sys.maxsize
+        limit = 4096
+    budget = max(64, limit - max_new_tokens - 16)   # leave headroom for special tokens
+    token_ids = tokenizer.encode(prompt, add_special_tokens=True)
+    if len(token_ids) <= budget:
+        return prompt
+    # Preserve the end of the prompt (question + "Answer:") by keeping tail tokens
+    return tokenizer.decode(token_ids[-budget:], skip_special_tokens=True)
+
+
 class GeneratorWrapper:
     """
     Thin wrapper that normalises the interface for both encoder-decoder
-    (seq2seq, e.g. Flan-T5) and decoder-only (causal LM, e.g. Llama 3.1,
-    Qwen3) models so the rest of the codebase needs no changes.
+    (seq2seq, e.g. Gemma, Flan-T5) and decoder-only (causal LM, e.g. Llama,
+    Qwen) models so the rest of the codebase needs no changes.
+
+    Key features:
+    - Auto-uses the HuggingFace chat template for instruct causal models so
+      answers are constrained to 1-5 words via a system prompt.
+    - Strips Qwen3 <think>...</think> chain-of-thought blocks automatically.
+    - Stops generation at the first newline for causal models to prevent
+      multi-paragraph explanations.
     """
 
     def __init__(self, pipe, is_causal: bool, model_name: str) -> None:
         self._pipe = pipe
         self.is_causal = is_causal
         self.model_name = model_name
+        # True when the tokenizer has a chat template (instruct / chat models)
+        self._has_chat_template: bool = (
+            is_causal
+            and hasattr(pipe.tokenizer, "apply_chat_template")
+            and pipe.tokenizer.chat_template is not None
+        )
 
     @property
     def model(self):
@@ -58,6 +74,62 @@ class GeneratorWrapper:
     def tokenizer(self):
         return self._pipe.tokenizer
 
+    # ── Answer post-processing (causal models only) ──────────────────────────
+    @staticmethod
+    def _extract_answer(text: str) -> str:
+        """
+        Post-process raw causal-LM output into a short, clean answer.
+
+        Steps:
+        1. Strip Qwen3-style <think>...</think> reasoning blocks.
+        2. Remove any leading role/label prefixes ("assistant", "Answer:").
+        3. Return only the first non-empty line so we never get multi-
+           paragraph explanations.
+        """
+        # 1. Remove chain-of-thought blocks (Qwen3 thinking mode)
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+        # 2. Drop common prefixes that instruct models sometimes emit
+        text = re.sub(r"(?i)^(answer\s*:\s*|assistant\s*:\s*|\bassistant\b\s*)", "", text.strip())
+        # 3. First non-empty line only
+        for line in text.split("\n"):
+            line = line.strip().rstrip(".")
+            if line:
+                return line
+        return text.strip()
+
+    # ── Prompt building ───────────────────────────────────────────────────
+    def make_qa_prompt(self, context: str, question: str) -> str:
+        """
+        Build the right prompt format for this model's architecture.
+
+        - Seq2seq (Gemma, Flan-T5): raw "Context / Question / Answer:" string.
+        - Causal instruct models (Llama, Qwen): HuggingFace chat template with
+          a system message that constrains the answer to 1-5 words.
+        - Causal base models (no chat template): raw f-string fallback.
+        """
+        if self._has_chat_template:
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a precise question-answering assistant. "
+                        "Answer the question using only the provided context. "
+                        "Give the shortest possible direct answer — "
+                        "ideally 1-5 words, never more than one sentence."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Context: {context}\n\nQuestion: {question}",
+                },
+            ]
+            return self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        # seq2seq or causal base model (no chat template)
+        return f"Context: {context}\nQuestion: {question}\nAnswer:"
+
+    # ── Generation ────────────────────────────────────────────────────────────
     def __call__(
         self,
         prompt: str,
@@ -67,11 +139,16 @@ class GeneratorWrapper:
     ) -> List[Dict[str, Any]]:
         """
         Generate text.  Always returns [{"generated_text": answer_only}].
-        For causal LMs  -> text-generation pipeline, return_full_text=False
-        For seq2seq     -> text2text-generation pipeline, max_length cap
+        • For causal LMs  → text-generation pipeline, return_full_text=False
+        • For seq2seq     → text2text-generation pipeline, max_length cap
         Temperature is only forwarded when do_sample=True to avoid
         transformer warnings / errors with greedy decoding.
         """
+        # Silently truncate the prompt to prevent token-overflow warnings /
+        # indexing errors for models with a hard token limit (e.g. 512 for
+        # enc-dec models, 4096 for some causal LMs).
+        prompt = _safe_prompt(self.tokenizer, prompt, max_length)
+
         kwargs: Dict[str, Any] = {"do_sample": do_sample}
         if do_sample and temperature != 1.0:
             kwargs["temperature"] = temperature
@@ -80,7 +157,8 @@ class GeneratorWrapper:
             kwargs["max_new_tokens"] = max_length
             kwargs["return_full_text"] = False
             out = self._pipe(prompt, **kwargs)
-            return [{"generated_text": out[0]["generated_text"].strip()}]
+            raw = out[0]["generated_text"].strip()
+            return [{"generated_text": self._extract_answer(raw)}]
         else:
             kwargs["max_length"] = max_length
             return self._pipe(prompt, **kwargs)
@@ -90,31 +168,66 @@ def get_generator(model_name: Optional[str] = None) -> "GeneratorWrapper":
     """
     Load a model and return a GeneratorWrapper.
     Auto-detects seq2seq vs causal-LM from the HuggingFace config.
+
+    For causal models we always use device_map="auto" so PyTorch spreads
+    weights across available GPUs / CPU when a single GPU is short on memory.
+    Models larger than ~7B parameters are additionally loaded in 4-bit
+    (bitsandbytes) when the package is available, halving VRAM requirements.
     """
     model_name = model_name or MODEL
 
     # Detect architecture before downloading weights.
-    config = AutoConfig.from_pretrained(model_name, token=HF_TOKEN)
+    config = AutoConfig.from_pretrained(model_name, token=HF_TOKEN, trust_remote_code=True)
     is_causal = not getattr(config, "is_encoder_decoder", False)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN)
-    # Causal tokenizers often lack a pad token; set it to eos_token so that
-    # batched inference and confidence computation work without warnings.
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, trust_remote_code=True)
     if is_causal and tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Prefer torch CUDA detection; keep env-var fallback for compatibility.
     device = 0 if (torch.cuda.is_available() or os.getenv("CUDA_AVAILABLE")) else -1
 
     if is_causal:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            token=HF_TOKEN,
-            torch_dtype=torch.float16 if device >= 0 else torch.float32,
-        )
-        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, device=device)
+        # Estimate parameter count to decide whether to quantise
+        num_params = getattr(config, "num_parameters", None)
+        if num_params is None:
+            # rough heuristic from hidden size + num layers
+            h = getattr(config, "hidden_size", 0)
+            l = getattr(config, "num_hidden_layers", 0)
+            num_params = h * l * 12  # very rough transformer estimate
+        large_model = num_params > 4_000_000_000  # >4B params
+
+        load_kwargs: dict = {
+            "token": HF_TOKEN,
+            "trust_remote_code": True,
+        }
+
+        if device >= 0:
+            # Try 4-bit quantisation for large models (needs bitsandbytes)
+            if large_model:
+                try:
+                    from transformers import BitsAndBytesConfig
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+                    load_kwargs["device_map"] = "auto"
+                    logger.info("Loading %s with 4-bit quantisation.", model_name)
+                except Exception:
+                    load_kwargs["device_map"] = "auto"
+                    load_kwargs["torch_dtype"] = torch.float16
+                    logger.info("Loading %s with device_map=auto fp16 (bitsandbytes unavailable).", model_name)
+            else:
+                load_kwargs["device_map"] = "auto"
+                load_kwargs["torch_dtype"] = torch.float16
+        else:
+            load_kwargs["torch_dtype"] = torch.float32
+
+        model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+        # When device_map is used the pipeline must not specify device=
+        pipe_device = None if "device_map" in load_kwargs else device
+        pipe_kwargs = {"model": model, "tokenizer": tokenizer}
+        if pipe_device is not None:
+            pipe_kwargs["device"] = pipe_device
+        pipe = pipeline("text-generation", **pipe_kwargs)
     else:
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, token=HF_TOKEN)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, token=HF_TOKEN, trust_remote_code=True)
         pipe = pipeline("text2text-generation", model=model, tokenizer=tokenizer, device=device)
 
     return GeneratorWrapper(pipe, is_causal=is_causal, model_name=model_name)
@@ -126,19 +239,25 @@ def _sequence_confidence_exp_mean_logprob(
     max_new_tokens: int,
 ) -> Optional[float]:
     """
-    Compute confidence as the average softmax probability over generated tokens.
+    Compute confidence as exp(mean token log-probability) over generated tokens.
     Returns value in (0, 1], or None if confidence cannot be computed.
 
     Works for both seq2seq and causal-LM:
-    seq2seq  -- output.sequences[0] is decoder output (decoder-start + tokens)
-    causal   -- output.sequences[0] is input + output tokens; taking the last
-                len(scores) elements gives exactly the generated tokens.
+    • seq2seq  — output.sequences[0] is decoder output (decoder-start + tokens)
+    • causal   — output.sequences[0] is input + output tokens; taking the last
+                 len(scores) elements gives exactly the generated tokens.
     """
     try:
         model = generator.model
         tokenizer = generator.tokenizer
 
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True)
+        # Truncate to model limit before tokenising (prevents overflow warnings)
+        prompt = _safe_prompt(tokenizer, prompt, max_new_tokens)
+
+        inputs = tokenizer(
+            prompt, return_tensors="pt",
+            truncation=True, max_length=getattr(tokenizer, "model_max_length", 512)
+        )
         device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -161,6 +280,8 @@ def _sequence_confidence_exp_mean_logprob(
 
         probs = []
         for step_logits, token_id in zip(scores, generated_token_ids):
+            # token_log_prob = F.log_softmax(step_logits[0], dim=-1)[int(token_id)]
+            # log_probs.append(token_log_prob.item())
             token_prob = F.softmax(step_logits[0], dim=-1)[int(token_id)]
             probs.append(token_prob.item())
 

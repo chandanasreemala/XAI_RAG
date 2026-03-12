@@ -1,8 +1,8 @@
 <div align="center">
 
-# FusionRAG-Ex
+# FusionRAG-Ex🚀
 
-### An Explainable Retrieval-Augmented Generation Framework with Multi-Mode Importance Scoring
+### An Interactive RAG Framework with Retrieval and Confidence-Aware Explanations
 
 [![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.95-009688?logo=fastapi)](https://fastapi.tiangolo.com/)
@@ -52,7 +52,7 @@ The framework ships with a fully interactive web UI, a multi-dataset evaluation 
 | **Flexible text splitting** | Sentence, word, phrase (noun-chunks), paragraph |
 | **Rich perturbation suite** | Leave-One-Out, Random Noise, Entity, Antonym, Synonym, Reorder |
 | **Multiple comparators** | Levenshtein, Jaro-Winkler, N-gram, Semantic (SBERT cosine) |
-| **Multi-dataset support** | HotpotQA, TriviaQA, HaluBench, or any custom JSONL corpus |
+| **Multi-dataset support** | HotpotQA, TriviaQA, or any custom JSONL corpus |
 | **Plug-and-play indexing** | One command builds both BM25 and FAISS indices from any JSONL file |
 | **Automatic evaluation** | Recall@K, Precision@K, MRR, MAP, NDCG@K across all retriever modes |
 | **Interactive web UI** | ExplainRAG tab + Comparative Analysis tab with per-mode context highlights |
@@ -63,7 +63,7 @@ The framework ships with a fully interactive web UI, a multi-dataset evaluation 
 ## 🏗️ Architecture
 
 <div align="center">
-  <img src="version_2/Retriever_Explorer.png" alt="FusionRAG-Ex Architecture" width="850"/>
+  <img src="version_2/Architecture.png" alt="FusionRAG-Ex Architecture" width="850"/>
 </div>
 
 The system is structured around four interacting layers:
@@ -109,10 +109,10 @@ Create a `.env` file inside `version_2/` (never commit this file):
 # Hugging Face token — required for gated models
 HF_TOKEN=hf_xxxxxxxxxxxx
 
-# Generator model (any causal / seq2seq HF model)
+# Generator model (any causal / seq2seq HF model) (This is a default model)
 HF_MODEL=google/flan-t5-large
 
-# Sentence-transformer model for dense retrieval
+# Sentence-transformer model for dense retrieval (This is a default model)
 SBERT_MODEL=sentence-transformers/all-mpnet-base-v2
 ```
 
@@ -163,7 +163,6 @@ The following pre-processed datasets are supported out of the box. Place the fil
 |---|---|---|
 | **HotpotQA** | `hotpot_docs.jsonl`, `hotpot_answers.jsonl` | Multi-hop QA, 83k+ passages |
 | **TriviaQA** | `trivia_docs.jsonl`, `trivia_answers.jsonl` | Open-domain QA, ~6k passages |
-| **HaluBench** | `halubench_docs.jsonl`, `halubench_answers.jsonl` | Hallucination-focused QA |
 
 To add your own dataset, drop two JSONL files (docs + answers) in `data/<your_dataset>/` and pass the path to the index builder.
 
@@ -236,6 +235,10 @@ http://localhost:8000/static/index.html
 ```
 
 The UI provides two main tabs:
+
+### Retriever Explorer Tab
+- Enter a question and select one or more retrievers, that you want to compare.
+- Retrieved documents along with the shared common docs across all retrievers are shown.  
 
 ### ExplainRAG Tab
 - Enter a question and select retriever, importance mode, perturbation strategy, and comparator.
