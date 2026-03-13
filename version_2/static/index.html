@@ -297,15 +297,19 @@
         .ret-badge.bm25    { background:rgba(139,92,246,.1); color:#8b5cf6; border:1px solid rgba(139,92,246,.3); }
         .ret-badge.hybrid  { background:rgba(16,185,129,.1);  color:#059669; border:1px solid rgba(16,185,129,.3); }
         /* .ret-badge.multi_query { background:rgba(245,158,11,.1); color:#d97706; border:1px solid rgba(245,158,11,.3); } */
-        .explorer-doc-table { width:100%; border-collapse:collapse; font-size:0.82rem; margin-top:10px; }
+        .explorer-doc-table { width:100%; table-layout:fixed; border-collapse:collapse; font-size:0.82rem; margin-top:10px; }
         .explorer-doc-table th {
             text-align:left; color:var(--text-muted); font-weight:600;
             padding:5px 8px; border-bottom:1px solid var(--border);
-            white-space:nowrap; font-size:0.78rem;
+            white-space:nowrap; font-size:0.78rem; overflow:hidden;
         }
-        .explorer-doc-table td { padding:7px 8px; border-bottom:1px solid var(--border); vertical-align:top; }
+        .explorer-doc-table th:nth-child(1) { width:28px; }
+        .explorer-doc-table th:nth-child(2) { width:68px; }
+        .explorer-doc-table th:nth-child(3) { width:80px; }
+        .explorer-doc-table th:nth-child(5) { width:62px; }
+        .explorer-doc-table td { padding:7px 8px; border-bottom:1px solid var(--border); vertical-align:top; overflow:hidden; }
         .explorer-doc-table tr:hover td { background:var(--bg-subtle); }
-        .explorer-doc-text { max-width: 380px; }
+        .explorer-doc-text { word-break:break-word; }
         .explorer-doc-text-inner {
             max-height: 55px; overflow: hidden; cursor: pointer;
             line-height: 1.5; color: var(--text-secondary);
@@ -1243,8 +1247,13 @@
                 if (!docs.length) {
                     inner += '<p style="color:var(--text-muted);font-size:0.85rem;">No documents returned.</p>';
                 } else {
+                    // Only show Shared? column for this retriever if it actually has shared docs
+                    var retHasShared = retNames.length > 1 && docs.some(function(item) {
+                        var id = String((item.doc || {}).id || item.id || '');
+                        return sharedIds.includes(id);
+                    });
                     inner += '<table class="explorer-doc-table"><thead><tr><th>#</th><th>Score</th><th>ID</th><th>Text</th>';
-                    if (sharedIds.length && retNames.length > 1) inner += '<th>Shared?</th>';
+                    if (retHasShared) inner += '<th>Shared?</th>';
                     inner += '</tr></thead><tbody>';
                     docs.forEach(function(item, i) {
                         var doc   = item.doc || {};
@@ -1260,7 +1269,7 @@
                             escHtml(id.substring(0,28)) + '</td>';
                         inner += '<td class="explorer-doc-text"><div class="explorer-doc-text-inner" onclick="this.classList.toggle(\'expanded\')">' +
                             escHtml(text.substring(0, 220)) + (text.length > 220 ? '&hellip;' : '') + '</div></td>';
-                        if (sharedIds.length && retNames.length > 1) {
+                        if (retHasShared) {
                             inner += '<td>' + (isShared ? '<span style="color:#059669;font-weight:700;">&#10003; shared</span>' : '') + '</td>';
                         }
                         inner += '</tr>';
