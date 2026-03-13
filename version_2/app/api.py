@@ -18,7 +18,7 @@ _std_logging.getLogger("transformers.tokenization_utils_base").setLevel(_std_log
 _std_logging.getLogger("transformers.pipelines.base").setLevel(_std_logging.ERROR)
 
 """
-RAG-Ex Core API
+FusionRAG-Ex API
 
 This version adds:
 - GET / homepage
@@ -60,7 +60,7 @@ AVAILABLE_MODELS = [
     # Qwen3-14B requires transformers >=4.51 and Python >=3.10.
     # Uncomment when environment is upgraded:
     # {"id": "Qwen/Qwen3-14B",                             "label": "Qwen3-14B (needs Python 3.10)"},
-    {"id": "Qwen/Qwen2.5-7B-Instruct",                    "label": "Qwen2.5 7B Instruct"},
+    {"id": "Qwen/Qwen2.5-14B-Instruct",                    "label": "Qwen2.5 14B Instruct"},
 ]
 
 # ---------------------------------------------------------------------------
@@ -300,7 +300,7 @@ def _gold_info_for_question(
     }
 
 app = FastAPI(
-    title="RAG-Ex Core API",
+    title="FusionRAG-Ex API",
     default_response_class=ORJSONResponse,
     version="1.1.1",
 )
@@ -508,9 +508,9 @@ def startup_event():
 def home():
     return """
     <html>
-      <head><title>RAG-Ex Core</title></head>
+      <head><title>FusionRAG-Ex</title></head>
       <body style="font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto;">
-        <h2>RAG-Ex Core API is running ✅</h2>
+        <h2>FusionRAG-Ex API is running ✅</h2>
         <p>Choose your interface:</p>
         <ul>
           <li><a href="/static/index.html"><strong>🚀 Interactive Web Interface</strong></a> (Recommended)</li>
@@ -635,7 +635,8 @@ def api_retrieve(
 class RetrieverCompareRequest(BaseModel):
     question: str = Field(..., description="Query to retrieve for")
     retrievers: List[str] = Field(
-        ["dense", "bm25", "hybrid", "multi_query"],
+        ["dense", "bm25", "hybrid"],
+        # "multi_query" temporarily disabled — uncomment to re-enable
         description="Which retrievers to compare",
     )
     top_k: int = Field(5, ge=1, le=20, description="Top-k per retriever")
@@ -655,19 +656,20 @@ def retrieve_compare(req: RetrieverCompareRequest):
     (for multi_query) which generated sub-queries were used.
     """
     model_id = (req.model or settings.HF_MODEL).strip()
-    gen = None
-    if "multi_query" in req.retrievers:
-        try:
-            gen = _get_generator_for_model(model_id)
-        except Exception:
-            pass  # multi_query will fall back to heuristic rewrites
+    # multi_query temporarily disabled — re-enable the block below when needed
+    # gen = None
+    # if "multi_query" in req.retrievers:
+    #     try:
+    #         gen = _get_generator_for_model(model_id)
+    #     except Exception:
+    #         pass  # multi_query will fall back to heuristic rewrites
 
     output: Dict[str, Any] = {}
     for rname in req.retrievers:
         try:
             kw: Dict[str, Any] = {"retriever": rname}
-            if rname == "multi_query" and gen is not None:
-                kw["generator"] = gen
+            # if rname == "multi_query" and gen is not None:
+            #     kw["generator"] = gen
             docs = retrieve(req.question, req.top_k, **kw)  # type: ignore
             # Extract queries_used from meta (attached by query_rewriter)
             queries_used: Optional[List[str]] = None
@@ -1033,10 +1035,10 @@ def explain(req: ExplainRequest):
 
     if req.importance_mode == "ragex_core":
         # ── Perturbation-based generator importance (baseline) ────────────
-        # Use softmax (same scale as RW and Fusion) so delta comparisons are meaningful.
-        # w_i = w'_i/max(w'_i)
-        normalized = _normalise(raw_dissimilarities)
-        # normalized = _softmax_normalise(raw_dissimilarities)
+        # Softmax normalisation — same scale as RW and Fusion for fair comparison.
+        # w_i = w'_i/max(w'_i)  ← max-norm kept for reference, disabled
+        # normalized = _normalise(raw_dissimilarities)
+        normalized = _softmax_normalise(raw_dissimilarities)
 
     #! --------> Change the normalisation to softmax in both ret weighted and fusion.----Done
 
@@ -1253,8 +1255,8 @@ def compare(req: CompareRequest):
 
     # All three modes use softmax normalization so scores are on the same scale
     # and the delta chart shows genuine differences, not a normalization artefact.
-    baseline_imp = _normalise(raw_dissimilarities)
-    # baseline_imp = _softmax_normalise_cmp(raw_dissimilarities)
+    # baseline_imp = _normalise(raw_dissimilarities)  ← max-norm kept for reference, disabled
+    baseline_imp = _softmax_normalise_cmp(raw_dissimilarities)
 
     normed_our = _softmax_normalise_cmp(raw_dissimilarities)
     raw_rw = {u: normed_our[u] * _unit_retrieval_weight(u, doc_weights) for u in units}
