@@ -99,12 +99,8 @@ Demo: Gary Harrison, began his career in the 1970s and has written over how many
 
 Who is the American internet entrepreneur who founded the company featured on 24 Hours on Craigslist?
 
-\Okay some modifications, the order that you should show...the system health section as the first one, then the retrived documents vs relevant documents side by side comparision if short docs, if long docs top bottom. If the retriever retrived the relevant doc just add a gold with prize symbol short label on top of it. Because we are just saying retrieved ranked it at rank #1 #2 #3 etc but not showing the actual ret docs.
-Next we should show the units along with its scores of baseline, RW and F
-Then we should show the Hypothesis: Does the retriever surface the most important document? section. 
-Last we shouls show the Context Importance Map and then last key observations. 
-
-Remember there are some edge cases that u should consider: like while showing the context importance map, show them in order as they are retrieved, not inorder of the most important unit first. 
 
 Which American college that has sent students to Centre for Medieval and Renaissance Studies was founded in 1874?
 compare dense and hybrid - 5 docs, flant5, cop fusion
+
+Which airport is closer to Cleaveland, Ohio, Luis Muñoz Marín International Airport or Rickenbacker International Airport?

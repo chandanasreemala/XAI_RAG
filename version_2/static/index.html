@@ -1299,14 +1299,11 @@
         var total  = sorted.length;
         var hiCut  = Math.max(1, Math.ceil(total * topPct / 100));
 
-        // Only highlight units genuinely above the mean. Require score > mean * 1.5
-        // as a minimum floor — EXCEPT when only 1 entry is passed (caller has already
-        // selected the single unit that must be shown; the floor would always block it).
-        var sumScores  = sorted.reduce(function(acc, e){ return acc + e[1]; }, 0);
-        var meanScore  = sumScores / Math.max(1, total);
-        var minScore   = total > 1 ? meanScore * 1.5 : 0;
+        // Highlight the top topPct% units by score. No mean-floor is applied —
+        // with softmax scores spread across many units the floor would block all
+        // highlights even when real signal exists. The topPct cut is already
+        // strict enough to avoid over-highlighting.
         var highUnits  = sorted.slice(0, hiCut)
-            .filter(function(e){ return e[1] > minScore; })
             .map(function(e){ return e[0]; });
 
         // Detect word-level: every unit is a single whitespace-free string
