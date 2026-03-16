@@ -4,8 +4,8 @@
 
 ### An Interactive RAG Framework with Retrieval and Confidence-Aware Explanations
 
-[![Interactive Space](https://img.shields.io/badge/BM25-sparse%20retrieval-orange)](https://huggingface.co/spaces/RAG-KDDLab/XAI_RAG)
-[![Demonstration Video]((https://img.shields.io/badge/license-MIT-purple))(https://www.youtube.com/watch?v=DpALH3pYBq4)]
+[![Interactive Space](https://img.shields.io/badge/Interactive%20Space-HuggingFace-yellow?logo=huggingface)](https://huggingface.co/spaces/RAG-KDDLab/XAI_RAG)
+[![Demonstration Video](https://img.shields.io/badge/Demo-YouTube-red?logo=youtube)](https://www.youtube.com/watch?v=DpALH3pYBq4)
 [![Python](https://img.shields.io/badge/python-3.8%2B-brightgreen)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.95-009688?logo=fastapi)](https://fastapi.tiangolo.com/)
 [![FAISS](https://img.shields.io/badge/FAISS-dense%20retrieval-blue)](https://github.com/facebookresearch/faiss)
