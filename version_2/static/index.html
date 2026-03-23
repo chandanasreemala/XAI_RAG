@@ -373,6 +373,78 @@
             gap: 6px;
         }
         .about-btn:hover { background: rgba(99,102,241,0.08); border-color: var(--primary); color: var(--primary); }
+
+        /* Reviewer Notes button */
+        .reviewer-btn {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            color: white;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            font-weight: 500;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .reviewer-btn:hover {
+            background: linear-gradient(135deg, #d97706, #b45309);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(245,158,11,0.35);
+        }
+
+        /* QA sample tables inside reviewer modal */
+        .reviewer-modal-box {
+            background: white;
+            border-radius: 14px;
+            padding: 32px 36px;
+            max-width: 860px;
+            width: 96%;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+            position: relative;
+        }
+        .qa-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            margin-bottom: 18px;
+            font-size: 0.84rem;
+        }
+        .qa-table thead th {
+            background: var(--primary);
+            color: white;
+            padding: 9px 12px;
+            text-align: left;
+            font-weight: 600;
+        }
+        .qa-table td {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+            color: var(--text-secondary);
+            vertical-align: top;
+            line-height: 1.55;
+        }
+        .qa-table tr:nth-child(even) td { background: var(--bg-subtle); }
+        .qa-table tr:hover td { background: #ede9fe; transition: background 0.2s; }
+        .qa-table td:first-child { width: 30px; text-align: center; font-weight: 700; color: var(--primary); }
+        .qa-table td:nth-child(2) { width: 62%; }
+        .qa-table td:nth-child(3) { font-weight: 600; color: var(--text-primary); }
+        .notice-box {
+            background: linear-gradient(135deg, #fef3c7, #fde68a);
+            border: 1px solid #f59e0b;
+            border-radius: 10px;
+            padding: 16px 18px;
+            margin-bottom: 22px;
+            font-size: 0.88rem;
+            color: #78350f;
+            line-height: 1.75;
+        }
+        .notice-box strong { color: #92400e; }
+
         .modal-overlay {
             display: none;
             position: fixed; inset: 0;
@@ -578,6 +650,9 @@
         <button class="about-btn" onclick="document.getElementById('aboutModal').classList.add('open')">
             &#8505; About
         </button>
+        <button class="reviewer-btn" onclick="document.getElementById('reviewerModal').classList.add('open')">
+            &#128204; Reviewer Notes
+        </button>
         <button class="new-chat-btn" onclick="newChat()">
             <span>&#128172;</span><span>New Chat</span>
         </button>
@@ -621,6 +696,61 @@
 
     <h3>Why is it useful?</h3>
     <p>RAG systems are often black boxes &mdash; you don&rsquo;t know <em>why</em> a particular answer was generated or whether the right documents were retrieved. FusionRAG-Ex surfaces that reasoning at the unit level across three complementary lenses, helping you debug retrieval failures, compare retrieval strategies, identify hallucinations, and understand which parts of the knowledge base actually drive the model&rsquo;s outputs.</p>
+  </div>
+</div>
+
+<!-- Reviewer Notes Modal -->
+<div class="modal-overlay" id="reviewerModal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="reviewer-modal-box">
+    <button class="modal-close" onclick="document.getElementById('reviewerModal').classList.remove('open')">&times;</button>
+    <h2>&#128204; Notes for Reviewers</h2>
+    <p class="modal-subtitle">Sample questions to try &mdash; and important notes about the hosted environments.</p>
+
+    <div class="notice-box">
+      <strong>&#9888;&nbsp; Important note about deployment environments:</strong><br><br>
+      If you clone our <strong>GitHub repository</strong> and follow the installation instructions to run the application on a server with a GPU, you will have access to <strong>all features</strong> &mdash; multiple retrievers (Dense, BM25, Hybrid), all perturber strategies, Comparative Analysis, Retriever Explorer, and the full dataset corpus &mdash; and responses will be generated in a <strong>reasonable response time</strong> thanks to GPU acceleration.<br><br>
+      The version hosted on <strong>Hugging Face Spaces</strong> is provided <em>for demonstration purposes only</em>. Due to strict storage and compute limits on Spaces, we must restrict it to <strong>smaller models</strong>. In particular, <strong>FLAN</strong> and <strong>Gemma</strong> models will both work, although <em>Gemma takes considerably longer to respond when running on CPU</em>. Some features and response speeds may therefore be reduced compared to a self-hosted GPU deployment.
+    </div>
+
+    <h3>&#128200; HotpotQA &mdash; 10 Sample Questions</h3>
+    <p>Multi-hop reasoning questions. Select <strong>HotpotQA</strong> in the sidebar Dataset panel before trying these.</p>
+    <table class="qa-table">
+      <thead>
+        <tr><th>#</th><th>Question</th><th>Expected Answer</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>Fast Cars, Danger, Fire and Knives includes guest appearances from which hip hop record executive?</td><td>Jaime Meline</td></tr>
+        <tr><td>2</td><td>Which airport is closer to Cleveland, Ohio &mdash; Luis Mu&ntilde;oz Mar&iacute;n International Airport or Rickenbacker International Airport?</td><td>Rickenbacker International Airport</td></tr>
+        <tr><td>3</td><td>Who is the American internet entrepreneur who founded the company featured on 24 Hours on Craigslist?</td><td>Craig Newmark</td></tr>
+        <tr><td>4</td><td>Which American college that has sent students to Centre for Medieval and Renaissance Studies was founded in 1874?</td><td>St. Olaf College</td></tr>
+        <tr><td>5</td><td>Gary Harrison began his career in the 1970s and has written over how many major-label recorded songs, including several number-one hits? (Another artist who has recorded his work is Bryan White, an American country music artist.)</td><td>300</td></tr>
+        <tr><td>6</td><td>In which American football game was Malcolm Smith named Most Valuable Player?</td><td>Super Bowl XLVIII</td></tr>
+        <tr><td>7</td><td>The 1988 American comedy film The Great Outdoors starred a four-time Academy Award nominee who received a star on the Hollywood Walk of Fame in what year?</td><td>2006</td></tr>
+        <tr><td>8</td><td>&ldquo;Human Error&rdquo; is the season finale of the third season of a TV show that aired on what network?</td><td>Fox</td></tr>
+        <tr><td>9</td><td>Dua Lipa&rsquo;s debut studio album spawned the number-one single &ldquo;New Rules&rdquo; &mdash; in what year was the album released?</td><td>2017</td></tr>
+        <tr><td>10</td><td>American politician Joe Heck ran unsuccessfully against Democrat Catherine Cortez Masto, who previously served as the 32nd Attorney General of which state?</td><td>Nevada</td></tr>
+      </tbody>
+    </table>
+
+    <h3>&#127922; TriviaQA &mdash; 10 Sample Questions</h3>
+    <p>Factoid questions from TriviaQA. Select <strong>TriviaQA</strong> in the sidebar Dataset panel before trying these.</p>
+    <table class="qa-table">
+      <thead>
+        <tr><th>#</th><th>Question</th><th>Expected Answer</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>Where in England was Dame Judi Dench born?</td><td>York</td></tr>
+        <tr><td>2</td><td>From which country did Angola achieve independence in 1975?</td><td>Portugal</td></tr>
+        <tr><td>3</td><td>Which city does David Soul come from?</td><td>Chicago</td></tr>
+        <tr><td>4</td><td>Who won Super Bowl XX?</td><td>Chicago Bears</td></tr>
+        <tr><td>5</td><td>Which was the first European country to abolish capital punishment?</td><td>Norway</td></tr>
+        <tr><td>6</td><td>In which country did the widespread use of ISDN begin in 1988?</td><td>Japan</td></tr>
+        <tr><td>7</td><td>What is Bruce Willis&rsquo; real first name?</td><td>Walter</td></tr>
+        <tr><td>8</td><td>Which William wrote the novel Lord of the Flies?</td><td>Golding</td></tr>
+        <tr><td>9</td><td>How is Joan Molinsky better known?</td><td>Joan Rivers</td></tr>
+        <tr><td>10</td><td>In which branch of the arts is Patricia Neary famous?</td><td>Ballet</td></tr>
+      </tbody>
+    </table>
   </div>
 </div>
 
