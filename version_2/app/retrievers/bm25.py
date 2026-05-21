@@ -8,16 +8,20 @@ from typing import Any, Dict, List, Optional
 
 from rank_bm25 import BM25Okapi
 from app.config import settings
+from app.retrievers._utils import dedupe_top_k
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?")
 
+
 def _tokenize(text: str) -> List[str]:
     return [m.group(0).lower() for m in _TOKEN_RE.finditer(text or "")]
+
 
 @dataclass
 class BM25Index:
     bm25: BM25Okapi
     docs: List[Dict[str, Any]]
+
 
 _BM25_CACHE: BM25Index | None = None
 
@@ -27,6 +31,7 @@ def invalidate_cache() -> None:
     Call this whenever the active dataset changes."""
     global _BM25_CACHE
     _BM25_CACHE = None
+
 
 def _load_docs_jsonl(path: str) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
@@ -45,6 +50,7 @@ def _load_docs_jsonl(path: str) -> List[Dict[str, Any]]:
         raise ValueError(f"No docs in {path}")
     return docs
 
+
 def build_index(
     docs_path: Optional[str] = None,
     bm25_path: Optional[str] = None,
@@ -62,6 +68,7 @@ def build_index(
         pickle.dump(idx, f)
     return idx
 
+
 def load_index(bm25_path: Optional[str] = None) -> BM25Index:
     if bm25_path is None:
         bm25_path = settings.BM25_INDEX_PATH
@@ -71,6 +78,7 @@ def load_index(bm25_path: Optional[str] = None) -> BM25Index:
     with open(bm25_path, "rb") as f:
         return pickle.load(f)
 
+
 def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
     global _BM25_CACHE
     if _BM25_CACHE is None:
@@ -79,17 +87,9 @@ def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
     q = _tokenize(query)
     scores = _BM25_CACHE.bm25.get_scores(q)
     # Fetch extra candidates so we can deduplicate and still return k results
-    top = sorted(range(len(scores)), key=lambda i: float(scores[i]), reverse=True)[:k * 4]
+    top = sorted(range(len(scores)), key=lambda i: float(scores[i]), reverse=True)[
+        : k * 4
+    ]
 
-    results: List[Dict[str, Any]] = []
-    seen_texts: set = set()
-    for i in top:
-        text = _BM25_CACHE.docs[i].get("text", "")
-        norm = text.lower().strip()
-        if norm in seen_texts:
-            continue
-        seen_texts.add(norm)
-        results.append({"doc": _BM25_CACHE.docs[i], "score": float(scores[i])})
-        if len(results) == k:
-            break
-    return results
+    candidates = [(_BM25_CACHE.docs[i], float(scores[i])) for i in top]
+    return dedupe_top_k(candidates, k)

@@ -20,12 +20,15 @@ _RERANKER: Optional[CrossEncoder] = None
 def _get_reranker(model_name: Optional[str] = None) -> CrossEncoder:
     global _RERANKER
     if _RERANKER is None:
-        name = model_name or getattr(settings, "BGE_RERANKER_MODEL", "BAAI/bge-reranker-base")
+        name = model_name or getattr(
+            settings, "BGE_RERANKER_MODEL", "BAAI/bge-reranker-base"
+        )
         # Prefer GPU if available; fallback to CPU
         device = "cuda" if torch.cuda.is_available() else "cpu"
         # CrossEncoder supports device=... in sentence-transformers
         _RERANKER = CrossEncoder(name, device=device)
     return _RERANKER
+
 
 def _minmax_scale(scores: List[float]) -> List[float]:
     if not scores:
@@ -88,12 +91,17 @@ def retrieve(
             merged[did] = {
                 "doc": copy.deepcopy(item["doc"]),
                 "dense_score": float(item.get("score", 0.0)),
-                "bm25_score": 0.0,
+                "bm25_raw": 0.0,
+                "bm25_norm": 0.0,
                 "hybrid_score": w_dense * float(s_scaled),
             }
         else:
-            merged[did]["dense_score"] = max(merged[did]["dense_score"], float(item.get("score", 0.0)))
-            merged[did]["hybrid_score"] = max(merged[did]["hybrid_score"], w_dense * float(s_scaled))
+            merged[did]["dense_score"] = max(
+                merged[did]["dense_score"], float(item.get("score", 0.0))
+            )
+            merged[did]["hybrid_score"] = max(
+                merged[did]["hybrid_score"], w_dense * float(s_scaled)
+            )
 
     for item, s_scaled in zip(sparse_res, sparse_scaled):
         did = _doc_id(item)
@@ -137,9 +145,9 @@ def retrieve(
             meta = {}
         meta = dict(meta)
         meta["hybrid_scores"] = {
-            "dense_norm": float(c.get("dense_score", 0.0)),     # already normalized
-            "bm25_norm": float(c.get("bm25_norm", 0.0)),        # 0–1 ✅
-            "hybrid_pre": float(c.get("hybrid_score", 0.0)),    # fused score
+            "dense_norm": float(c.get("dense_score", 0.0)),  # already normalized
+            "bm25_norm": float(c.get("bm25_norm", 0.0)),  # 0–1 ✅
+            "hybrid_pre": float(c.get("hybrid_score", 0.0)),  # fused score
             "reranker": float(rr),
             # optional: keep raw for debugging
             "bm25_raw": float(c.get("bm25_raw", 0.0)),

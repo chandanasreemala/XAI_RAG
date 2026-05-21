@@ -1,7 +1,9 @@
 from typing import Any, Dict, List, Optional, Tuple, Union
-import math
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn.functional as F
@@ -31,9 +33,9 @@ def _safe_prompt(tokenizer, prompt: str, max_new_tokens: int) -> str:
     4096 in that case so we never build an absurdly large input tensor.
     """
     limit = getattr(tokenizer, "model_max_length", 512)
-    if limit > 1_000_000:   # guard against tokenizers that set this to sys.maxsize
+    if limit > 1_000_000:  # guard against tokenizers that set this to sys.maxsize
         limit = 4096
-    budget = max(64, limit - max_new_tokens - 16)   # leave headroom for special tokens
+    budget = max(64, limit - max_new_tokens - 16)  # leave headroom for special tokens
     token_ids = tokenizer.encode(prompt, add_special_tokens=True)
     if len(token_ids) <= budget:
         return prompt
@@ -89,7 +91,9 @@ class GeneratorWrapper:
         # 1. Remove chain-of-thought blocks (Qwen3 thinking mode)
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
         # 2. Drop common prefixes that instruct models sometimes emit
-        text = re.sub(r"(?i)^(answer\s*:\s*|assistant\s*:\s*|\bassistant\b\s*)", "", text.strip())
+        text = re.sub(
+            r"(?i)^(answer\s*:\s*|assistant\s*:\s*|\bassistant\b\s*)", "", text.strip()
+        )
         # 3. First non-empty line only
         for line in text.split("\n"):
             line = line.strip().rstrip(".")
@@ -99,35 +103,7 @@ class GeneratorWrapper:
 
     # ── Prompt building ───────────────────────────────────────────────────
     def make_qa_prompt(self, context: str, question: str) -> str:
-        """
-        Build the right prompt format for this model's architecture.
-
-        - Seq2seq (Gemma, Flan-T5): raw "Context / Question / Answer:" string.
-        - Causal instruct models (Llama, Qwen): HuggingFace chat template with
-          a system message that constrains the answer to 1-5 words.
-        - Causal base models (no chat template): raw f-string fallback.
-        """
-        if self._has_chat_template:
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a precise question-answering assistant. "
-                        "Answer the question using only the provided context. "
-                        "Give the shortest possible direct answer — "
-                        "ideally 1-5 words, never more than one sentence."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Context: {context}\n\nQuestion: {question}",
-                },
-            ]
-            return self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        # seq2seq or causal base model (no chat template)
-        return f"Context: {context}\nQuestion: {question}\nAnswer:"
+        return make_qa_prompt(self, context, question)
 
     # ── Generation ────────────────────────────────────────────────────────────
     def __call__(
@@ -177,10 +153,14 @@ def get_generator(model_name: Optional[str] = None) -> "GeneratorWrapper":
     model_name = model_name or MODEL
 
     # Detect architecture before downloading weights.
-    config = AutoConfig.from_pretrained(model_name, token=HF_TOKEN, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(
+        model_name, token=HF_TOKEN, trust_remote_code=True
+    )
     is_causal = not getattr(config, "is_encoder_decoder", False)
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name, token=HF_TOKEN, trust_remote_code=True
+    )
     if is_causal and tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -206,13 +186,19 @@ def get_generator(model_name: Optional[str] = None) -> "GeneratorWrapper":
             if large_model:
                 try:
                     from transformers import BitsAndBytesConfig
-                    load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+
+                    load_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True
+                    )
                     load_kwargs["device_map"] = "auto"
                     logger.info("Loading %s with 4-bit quantisation.", model_name)
                 except Exception:
                     load_kwargs["device_map"] = "auto"
                     load_kwargs["torch_dtype"] = torch.float16
-                    logger.info("Loading %s with device_map=auto fp16 (bitsandbytes unavailable).", model_name)
+                    logger.info(
+                        "Loading %s with device_map=auto fp16 (bitsandbytes unavailable).",
+                        model_name,
+                    )
             else:
                 load_kwargs["device_map"] = "auto"
                 load_kwargs["torch_dtype"] = torch.float16
@@ -227,19 +213,80 @@ def get_generator(model_name: Optional[str] = None) -> "GeneratorWrapper":
             pipe_kwargs["device"] = pipe_device
         pipe = pipeline("text-generation", **pipe_kwargs)
     else:
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, token=HF_TOKEN, trust_remote_code=True)
-        pipe = pipeline("text2text-generation", model=model, tokenizer=tokenizer, device=device)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_name, token=HF_TOKEN, trust_remote_code=True
+        )
+        pipe = pipeline(
+            "text2text-generation", model=model, tokenizer=tokenizer, device=device
+        )
 
     return GeneratorWrapper(pipe, is_causal=is_causal, model_name=model_name)
 
 
-def _sequence_confidence_exp_mean_logprob(
+_SYSTEM_INSTRUCTION = (
+    "You are a precise question-answering assistant. "
+    "Answer the question using only the provided context. "
+    "Give the shortest possible direct answer — "
+    "ideally 1-5 words, never more than one sentence."
+)
+
+
+def make_qa_prompt(gen: "GeneratorWrapper", context: str, question: str) -> str:
+    """
+    Build the right prompt format for the loaded model.
+
+    Tries system+user chat template first; falls back to merged user message
+    for models that reject a system role (e.g. Gemma); then raw QA format.
+    """
+    tokenizer = gen.tokenizer
+    is_causal = getattr(gen, "is_causal", False)
+    has_chat = (
+        is_causal
+        and hasattr(tokenizer, "apply_chat_template")
+        and getattr(tokenizer, "chat_template", None) is not None
+    )
+    if has_chat:
+        try:
+            messages = [
+                {"role": "system", "content": _SYSTEM_INSTRUCTION},
+                {
+                    "role": "user",
+                    "content": f"Context: {context}\n\nQuestion: {question}",
+                },
+            ]
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            pass
+        try:
+            messages = [
+                {
+                    "role": "user",
+                    "content": (
+                        f"{_SYSTEM_INSTRUCTION}\n\n"
+                        f"Context: {context}\n\nQuestion: {question}"
+                    ),
+                }
+            ]
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception as exc:
+            logger.warning(
+                "make_qa_prompt: apply_chat_template failed (%s), using raw format.",
+                exc,
+            )
+    return f"Context: {context}\nQuestion: {question}\nAnswer:"
+
+
+def _sequence_confidence_mean_token_prob(
     generator: "GeneratorWrapper",
     prompt: str,
     max_new_tokens: int,
 ) -> Optional[float]:
     """
-    Compute confidence as exp(mean token log-probability) over generated tokens.
+    Compute confidence as the mean softmax probability of generated tokens.
     Returns value in (0, 1], or None if confidence cannot be computed.
 
     Works for both seq2seq and causal-LM:
@@ -255,8 +302,10 @@ def _sequence_confidence_exp_mean_logprob(
         prompt = _safe_prompt(tokenizer, prompt, max_new_tokens)
 
         inputs = tokenizer(
-            prompt, return_tensors="pt",
-            truncation=True, max_length=getattr(tokenizer, "model_max_length", 512)
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=getattr(tokenizer, "model_max_length", 512),
         )
         device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -276,7 +325,7 @@ def _sequence_confidence_exp_mean_logprob(
         # sequence[-len(scores):] gives the newly generated token IDs for
         # both seq2seq (decoder tokens) and causal-LM (post-prompt tokens).
         sequence = output.sequences[0]
-        generated_token_ids = sequence[-len(scores):]
+        generated_token_ids = sequence[-len(scores) :]
 
         probs = []
         for step_logits, token_id in zip(scores, generated_token_ids):
@@ -312,7 +361,7 @@ def generate_answer(
     if not return_confidence:
         return text
 
-    confidence = _sequence_confidence_exp_mean_logprob(
+    confidence = _sequence_confidence_mean_token_prob(
         generator=generator,
         prompt=prompt,
         max_new_tokens=max_length,

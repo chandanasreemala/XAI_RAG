@@ -1,20 +1,27 @@
 # app/api.py
 import os
+
 # Must be set before ANY library imports to prevent macOS OMP segfault
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OBJC_DISABLE_INITIALIZE_FORK_SAFETY"] = "YES"
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"  # suppress sequential-GPU advisory
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = (
+    "1"  # suppress sequential-GPU advisory
+)
 
 import warnings
+
 warnings.filterwarnings("ignore", message=".*Token indices sequence length.*")
 warnings.filterwarnings("ignore", message=".*sequentially on GPU.*")
 
 # Suppress HuggingFace logging-based advisories (these use logging, not warnings)
 import logging as _std_logging
-_std_logging.getLogger("transformers.tokenization_utils_base").setLevel(_std_logging.ERROR)
+
+_std_logging.getLogger("transformers.tokenization_utils_base").setLevel(
+    _std_logging.ERROR
+)
 _std_logging.getLogger("transformers.pipelines.base").setLevel(_std_logging.ERROR)
 
 """
@@ -36,50 +43,36 @@ import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
-import torch
-import torch.nn.functional as torch_F
-
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, ORJSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import os
 
 from app.config import settings
-from app.generator import get_generator, generate_answer, GeneratorWrapper
+from app.datasets import DATASET_CONFIGS
+from app.generator import (
+    get_generator,
+    generate_answer,
+    GeneratorWrapper,
+    make_qa_prompt,
+)
+from app import pipeline as rag_pipeline
 from app.retriever import retrieve
 
 # ---------------------------------------------------------------------------
 # Available models — keep in sync with what your hardware can serve
 # ---------------------------------------------------------------------------
 AVAILABLE_MODELS = [
-    {"id": "google/flan-t5-small",                          "label": "Flan-T5 Small (default, fast)"},
-    {"id": "google/gemma-2b-it",                           "label": "Gemma 2b Instruct"},
-    {"id": "meta-llama/Llama-3.1-8B-Instruct",             "label": "Llama 3.1 8B Instruct"},
+    {"id": "google/flan-t5-small", "label": "Flan-T5 Small (default, fast)"},
+    {"id": "google/gemma-2b-it", "label": "Gemma 2b Instruct"},
+    {"id": "meta-llama/Llama-3.1-8B-Instruct", "label": "Llama 3.1 8B Instruct"},
     # Qwen3-14B requires transformers >=4.51 and Python >=3.10.
     # Uncomment when environment is upgraded:
     # {"id": "Qwen/Qwen3-14B",                             "label": "Qwen3-14B (needs Python 3.10)"},
-    {"id": "Qwen/Qwen2.5-14B-Instruct",                    "label": "Qwen2.5 14B Instruct"},
+    {"id": "Qwen/Qwen2.5-14B-Instruct", "label": "Qwen2.5 14B Instruct"},
 ]
 
-# ---------------------------------------------------------------------------
-# Dataset configurations — maps dataset key -> file paths
-# ---------------------------------------------------------------------------
-DATASET_CONFIGS: Dict[str, Dict[str, str]] = {
-    "hotpot": {
-        "DOCUMENTS_PATH":  "data/hotpot/hotpot_docs.jsonl",
-        "FAISS_INDEX_PATH": "data/hotpot/hotpot_faiss.index",
-        "BM25_INDEX_PATH":  "data/hotpot/hotpot_bm25.pkl",
-        "label":           "HotpotQA",
-    },
-    "trivia": {
-        "DOCUMENTS_PATH":  "data/trivia/trivia_docs.jsonl",
-        "FAISS_INDEX_PATH": "data/trivia/trivia_faiss.index",
-        "BM25_INDEX_PATH":  "data/trivia/trivia_bm25.pkl",
-        "label":           "TriviaQA (Wikipedia)",
-    },
-}
 
 # Infer the active dataset from the current settings path at import time
 def _infer_active_dataset() -> str:
@@ -88,68 +81,13 @@ def _infer_active_dataset() -> str:
             return key
     return list(DATASET_CONFIGS.keys())[0]
 
+
 _ACTIVE_DATASET: str = _infer_active_dataset()
 
 # Lazy cache: model_name -> GeneratorWrapper (loaded on first request)
 _GENERATOR_CACHE: Dict[str, GeneratorWrapper] = {}
 _GENERATOR_CACHE_LOCK = __import__("threading").Lock()
-
-
-def _make_qa_prompt(gen: "GeneratorWrapper", context: str, question: str) -> str:
-    """
-    Build the right prompt format for the loaded model.
-
-    Strategy for causal instruct models:
-      1. Try apply_chat_template with a system + user message (Llama, Qwen).
-      2. If the model rejects the system role (e.g. Gemma), retry with the
-         instruction merged into the user message.
-      3. If apply_chat_template fails entirely, fall back to raw format.
-    """
-    tokenizer = gen.tokenizer
-    is_causal = getattr(gen, "is_causal", False)
-    has_chat = (
-        is_causal
-        and hasattr(tokenizer, "apply_chat_template")
-        and getattr(tokenizer, "chat_template", None) is not None
-    )
-    SYSTEM_INSTRUCTION = (
-        "You are a precise question-answering assistant. "
-        "Answer the question using only the provided context. "
-        "Give the shortest possible direct answer — "
-        "ideally 1-5 words, never more than one sentence."
-    )
-    if has_chat:
-        # Attempt 1: system + user (works for Llama, Qwen)
-        try:
-            messages = [
-                {"role": "system", "content": SYSTEM_INSTRUCTION},
-                {"role": "user",   "content": f"Context: {context}\n\nQuestion: {question}"},
-            ]
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except Exception:
-            pass
-        # Attempt 2: merge instruction into user message (works for Gemma-it)
-        try:
-            messages = [
-                {
-                    "role": "user",
-                    "content": (
-                        f"{SYSTEM_INSTRUCTION}\n\n"
-                        f"Context: {context}\n\nQuestion: {question}"
-                    ),
-                }
-            ]
-            return tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        except Exception as e:
-            logger.warning(
-                "_make_qa_prompt: apply_chat_template failed (%s), using raw format.", e
-            )
-    return f"Context: {context}\nQuestion: {question}\nAnswer:"
-
+_DATASET_LOCK = __import__("threading").Lock()
 
 
 def _get_generator_for_model(model_name: str) -> GeneratorWrapper:
@@ -163,7 +101,8 @@ def _get_generator_for_model(model_name: str) -> GeneratorWrapper:
             _GENERATOR_CACHE[model_name] = get_generator(model_name)
             logger.info("Generator loaded: %s", model_name)
     return _GENERATOR_CACHE[model_name]
-from app.perturb import perturb_sentence, split_context
+
+
 from app.comparator import COMPARATORS
 
 logger = logging.getLogger("uvicorn.error")
@@ -171,10 +110,14 @@ logger = logging.getLogger("uvicorn.error")
 # ---------------------------------------------------------------------------
 # Gold-data cache (built once at startup, and refreshed on dataset switch)
 # ---------------------------------------------------------------------------
-_GOLD_ANSWERS: Optional[Dict[str, str]] = None        # question_id -> answer
-_GOLD_DOCS: Optional[Dict[str, List[str]]] = None     # base_id     -> [relevant_doc_ids]
-_GOLD_DOC_TEXTS: Optional[Dict[str, str]] = None      # doc_id      -> text  (relevant docs only)
-_GOLD_QUESTION_LOOKUP: Optional[Dict[str, str]] = None # norm_question_text -> question_id
+_GOLD_ANSWERS: Optional[Dict[str, str]] = None  # question_id -> answer
+_GOLD_DOCS: Optional[Dict[str, List[str]]] = None  # base_id     -> [relevant_doc_ids]
+_GOLD_DOC_TEXTS: Optional[Dict[str, str]] = (
+    None  # doc_id      -> text  (relevant docs only)
+)
+_GOLD_QUESTION_LOOKUP: Optional[Dict[str, str]] = (
+    None  # norm_question_text -> question_id
+)
 
 
 def _norm_question(q: str) -> str:
@@ -187,8 +130,8 @@ def _build_answer_cache() -> None:
     global _GOLD_ANSWERS, _GOLD_DOCS, _GOLD_DOC_TEXTS, _GOLD_QUESTION_LOOKUP
 
     docs_path = settings.DOCUMENTS_PATH
-    docs_dir  = os.path.dirname(os.path.abspath(docs_path))
-    basename  = os.path.basename(docs_path)
+    docs_dir = os.path.dirname(os.path.abspath(docs_path))
+    basename = os.path.basename(docs_path)
     # Derive answers filename: replace trailing _docs.jsonl -> _answers.jsonl
     answers_basename = basename.replace("_docs.jsonl", "_answers.jsonl")
     answers_path = os.path.join(docs_dir, answers_basename)
@@ -215,13 +158,16 @@ def _build_answer_cache() -> None:
                             _GOLD_QUESTION_LOOKUP[nq] = qid
                 except Exception:
                     pass
-        logger.info("Gold answers loaded: %d entries, %d unique questions",
-                    len(_GOLD_ANSWERS), len(_GOLD_QUESTION_LOOKUP))
+        logger.info(
+            "Gold answers loaded: %d entries, %d unique questions",
+            len(_GOLD_ANSWERS),
+            len(_GOLD_QUESTION_LOOKUP),
+        )
     else:
         logger.warning("Answers file not found at %s", answers_path)
 
     # --- docs (relevant = no '_irr_' in id) ---
-    _GOLD_DOCS = {}       # base_id -> [doc_ids that are relevant]
+    _GOLD_DOCS = {}  # base_id -> [doc_ids that are relevant]
     _GOLD_DOC_TEXTS = {}  # doc_id  -> text  (relevant docs only)
     if os.path.exists(docs_path):
         with open(docs_path, encoding="utf-8") as fh:
@@ -235,7 +181,7 @@ def _build_answer_cache() -> None:
                     if not doc_id or "_irr_" in doc_id:
                         continue
                     # base_id is everything before the last '_<digit(s)>' suffix
-                    m = re.match(r'^(.+)_\d+$', doc_id)
+                    m = re.match(r"^(.+)_\d+$", doc_id)
                     if not m:
                         continue
                     base = m.group(1)
@@ -243,8 +189,11 @@ def _build_answer_cache() -> None:
                     _GOLD_DOC_TEXTS[doc_id] = item.get("text", "")
                 except Exception:
                     pass
-        logger.info("Gold doc groups loaded: %d base-IDs, %d relevant docs",
-                    len(_GOLD_DOCS), len(_GOLD_DOC_TEXTS))
+        logger.info(
+            "Gold doc groups loaded: %d base-IDs, %d relevant docs",
+            len(_GOLD_DOCS),
+            len(_GOLD_DOC_TEXTS),
+        )
     else:
         logger.warning("Docs file not found at %s", docs_path)
 
@@ -266,14 +215,14 @@ def _gold_info_for_question(
     gold_answer = _GOLD_ANSWERS.get(question_id)
 
     # Derive base_id: strip trailing _<N>
-    m = re.match(r'^(.+)_\d+$', question_id)
+    m = re.match(r"^(.+)_\d+$", question_id)
     base_id = m.group(1) if m else question_id
     gold_doc_ids: List[str] = _GOLD_DOCS.get(base_id, [])
     n_gold = len(gold_doc_ids)
 
     # Count how many gold doc IDs appear in the retrieved set
     retrieved_ids: set = set()
-    for item in (retrieved_docs or []):
+    for item in retrieved_docs or []:
         if isinstance(item, dict) and "doc" in item:
             did = item["doc"].get("id", "")
             if did:
@@ -286,8 +235,7 @@ def _gold_info_for_question(
     gold_docs: List[Dict[str, Any]] = []
     if _GOLD_DOC_TEXTS is not None:
         gold_docs = [
-            {"id": gid, "text": _GOLD_DOC_TEXTS.get(gid, "")}
-            for gid in gold_doc_ids
+            {"id": gid, "text": _GOLD_DOC_TEXTS.get(gid, "")} for gid in gold_doc_ids
         ]
 
     return {
@@ -299,6 +247,7 @@ def _gold_info_for_question(
         "retriever_recall": recall,
     }
 
+
 app = FastAPI(
     title="FusionRAG-Ex API",
     default_response_class=ORJSONResponse,
@@ -309,7 +258,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In production, specify exact origins
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -318,6 +267,7 @@ app.add_middleware(
 static_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 if os.path.exists(static_path):
     app.mount("/static", StaticFiles(directory=static_path), name="static")
+
 
 # ----------------------------
 # Models
@@ -332,14 +282,19 @@ class ExplainRequest(BaseModel):
     question: str = Field(..., min_length=1, description="User question")
 
     # If context is empty, API uses retrieval (RAG mode).
-    context: str = Field("", description="Optional context. If empty, retriever is used to build context.")
+    context: str = Field(
+        "",
+        description="Optional context. If empty, retriever is used to build context.",
+    )
 
     # retrieval
     retriever: str = Field(
         default=getattr(settings, "RETRIEVER_DEFAULT", "dense"),
         description="Retriever to use when context is empty (RAG mode): dense | bm25 | hybrid",
     )
-    top_k_docs: int = Field(3, ge=1, le=50, description="Number of docs to retrieve when context is empty")
+    top_k_docs: int = Field(
+        3, ge=1, le=50, description="Number of docs to retrieve when context is empty"
+    )
 
     # explanation / perturbation
     explanation_level: str = Field(
@@ -359,7 +314,9 @@ class ExplainRequest(BaseModel):
 
     # generation
     max_length: int = Field(256, ge=16, le=2048, description="Max generation length")
-    temperature: float = Field(0.0, ge=0.0, le=2.0, description="Generation temperature (0 = deterministic)")
+    temperature: float = Field(
+        0.0, ge=0.0, le=2.0, description="Generation temperature (0 = deterministic)"
+    )
 
     # confidence threshold
     confidence_threshold: float = Field(
@@ -385,11 +342,10 @@ class ExplainRequest(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Fusion weight used only by 'confidence_retrieval_fusion'. "
-            "α=1.0 weights entirely on response dissimilarity; "
-            "α=0.0 weights entirely on generation confidence drop; "
-            "α=0.5 (default) gives equal weight to both generator-side signals "
-            "before retrieval relevance gating is applied."
+            "Fusion weight for 'confidence_retrieval_fusion' only. "
+            "α=1.0 emphasizes retrieval relevance; α=0.0 emphasizes "
+            "generation confidence drop; both are multiplied by softmax-normalised "
+            "perturbation dissimilarity before the final softmax."
         ),
     )
 
@@ -413,7 +369,6 @@ class ExplainRequest(BaseModel):
 
 
 class ExplainResponse(BaseModel):
-
     context_used: str
     prompt: str
     original_answer: str
@@ -434,18 +389,22 @@ class ExplainResponse(BaseModel):
 # Cross-mode comparison models  (used by /compare endpoint)
 # ---------------------------------------------------------------------------
 
+
 class UnitSignals(BaseModel):
     """All signals for a single explanation unit, computed in one perturbation pass."""
+
     unit: str
-    raw_dissimilarity: float          # how much the answer changes when this unit is removed
-    confidence_drop: float            # how much generation confidence falls when this unit is removed
-    retrieval_weight: float           # softmax-normalised retrieval score of the source document
-    baseline_importance: float        # normalised importance (ragex_core)
-    ret_weighted_importance: float    # normalised importance (retrieval_weighted)
-    fusion_importance: float          # normalised importance (confidence_retrieval_fusion)
-    baseline_rank: int                # rank position in ragex_core (1 = highest)
-    ret_weighted_rank: int            # rank position in retrieval_weighted
-    fusion_rank: int                  # rank position in confidence_retrieval_fusion
+    raw_dissimilarity: float  # how much the answer changes when this unit is removed
+    confidence_drop: (
+        float  # how much generation confidence falls when this unit is removed
+    )
+    retrieval_weight: float  # softmax-normalised retrieval score of the source document
+    baseline_importance: float  # normalised importance (ragex_core)
+    ret_weighted_importance: float  # normalised importance (retrieval_weighted)
+    fusion_importance: float  # normalised importance (confidence_retrieval_fusion)
+    baseline_rank: int  # rank position in ragex_core (1 = highest)
+    ret_weighted_rank: int  # rank position in retrieval_weighted
+    fusion_rank: int  # rank position in confidence_retrieval_fusion
 
 
 class CompareRequest(BaseModel):
@@ -465,6 +424,7 @@ class CompareRequest(BaseModel):
 
 class CounterfactualResult(BaseModel):
     """Result of a single counterfactual re-ranking probe."""
+
     # 'already_correct' | 'rank_matters' | 'retriever_failure'
     diagnosis: str
     # 1-indexed rank of the retrieved doc that contained the gold answer (None = not found)
@@ -576,20 +536,18 @@ def switch_dataset(req: SwitchDatasetRequest):
         }
 
     cfg = DATASET_CONFIGS[key]
-    # Mutate settings so all retrievers pick up the new paths
-    settings.DOCUMENTS_PATH   = cfg["DOCUMENTS_PATH"]
-    settings.FAISS_INDEX_PATH = cfg["FAISS_INDEX_PATH"]
-    settings.BM25_INDEX_PATH  = cfg["BM25_INDEX_PATH"]
+    with _DATASET_LOCK:
+        settings.DOCUMENTS_PATH = cfg["DOCUMENTS_PATH"]
+        settings.FAISS_INDEX_PATH = cfg["FAISS_INDEX_PATH"]
+        settings.BM25_INDEX_PATH = cfg["BM25_INDEX_PATH"]
 
-    # Invalidate both in-memory retriever caches so they reload from the new indices
-    _bm25_mod.invalidate_cache()
-    from app.retrievers import dense_faiss as _faiss_mod
-    _faiss_mod.invalidate_cache()
+        _bm25_mod.invalidate_cache()
+        from app.retrievers import dense_faiss as _faiss_mod
 
-    # Rebuild the gold answer / doc cache for the new dataset
-    _build_answer_cache()
+        _faiss_mod.invalidate_cache()
 
-    _ACTIVE_DATASET = key
+        _build_answer_cache()
+        _ACTIVE_DATASET = key
     logger.info("Dataset switched to '%s' (%s)", key, cfg["label"])
 
     return {
@@ -606,7 +564,9 @@ def switch_dataset(req: SwitchDatasetRequest):
 def api_retrieve(
     q: str = Query(..., description="Query string"),
     k: int = Query(3, ge=1, le=50, description="Top-k documents"),
-    retriever_name: str = Query("dense", description="Retriever: dense | bm25"),
+    retriever_name: str = Query(
+        "dense", description="Retriever: dense | bm25 | hybrid | multi_query"
+    ),
 ):
     """
     Retrieve top-k docs. Supports switching retrievers if app.retriever.retrieve supports it.
@@ -632,6 +592,7 @@ def api_retrieve(
 # /retrieve/compare — run multiple retrievers side-by-side (Explorer)
 # ---------------------------------------------------------------------------
 
+
 class RetrieverCompareRequest(BaseModel):
     question: str = Field(..., description="Query to retrieve for")
     retrievers: List[str] = Field(
@@ -645,7 +606,7 @@ class RetrieverCompareRequest(BaseModel):
 
 class RetrieverCompareResponse(BaseModel):
     question: str
-    results: Dict[str, Any]   # {retriever_name: {docs, queries_used?}}
+    results: Dict[str, Any]  # {retriever_name: {docs, queries_used?}}
 
 
 @app.post("/retrieve/compare", response_model=RetrieverCompareResponse)
@@ -655,15 +616,6 @@ def retrieve_compare(req: RetrieverCompareRequest):
     so the UI can diff which documents were found, what scores they got, and
     (for multi_query) which generated sub-queries were used.
     """
-    model_id = (req.model or settings.HF_MODEL).strip()
-    # multi_query temporarily disabled — re-enable the block below when needed
-    # gen = None
-    # if "multi_query" in req.retrievers:
-    #     try:
-    #         gen = _get_generator_for_model(model_id)
-    #     except Exception:
-    #         pass  # multi_query will fall back to heuristic rewrites
-
     output: Dict[str, Any] = {}
     for rname in req.retrievers:
         try:
@@ -673,7 +625,7 @@ def retrieve_compare(req: RetrieverCompareRequest):
             docs = retrieve(req.question, req.top_k, **kw)  # type: ignore
             # Extract queries_used from meta (attached by query_rewriter)
             queries_used: Optional[List[str]] = None
-            for d in (docs or []):
+            for d in docs or []:
                 if isinstance(d, dict):
                     _meta = d.get("meta") or (d.get("doc") or {}).get("meta") or {}
                     _qu = _meta.get("queries_used") if isinstance(_meta, dict) else None
@@ -687,111 +639,31 @@ def retrieve_compare(req: RetrieverCompareRequest):
     return RetrieverCompareResponse(question=req.question, results=output)
 
 
-# ---------------------------------------------------------------------------
-# Helpers for retrieval relevance weighting
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Context length management
-# ---------------------------------------------------------------------------
-# Maximum characters to keep from each retrieved document's text before joining
-# into the context prompt.  1 400 chars ≈ 350 tokens — safely below the 384-token
-# limit of SBERT/cross-encoders and leaves plenty of room for the question.
-_MAX_DOC_CHARS: int = 1400
-
-# Maximum number of explanation units to run the perturbation loop over.
-# TriviaQA passages can produce 40+ sentences; capping prevents multi-minute waits.
-_MAX_UNITS: int = 25
-
-
-def _cap_doc_text(text: str, max_chars: int = _MAX_DOC_CHARS) -> str:
-    """Return the first `max_chars` characters of a document's text.
-    Preserves whole words by snapping back to the last space before the cutoff.
-    """
-    if len(text) <= max_chars:
-        return text
-    # Try to end on a word boundary
-    cut = text.rfind(" ", 0, max_chars)
-    return text[:cut] if cut > 0 else text[:max_chars]
-
-
-def _softmax_retrieval_weights(retrieved_docs: List[Dict[str, Any]]) -> Dict[str, float]:
-    """
-    Compute a softmax-normalised weight for each retrieved document.
-    Returns {doc_text: weight} so weights sum to 1.0.
-    Falls back to uniform weights if scores are unavailable.
-    """
-    import math
-    if not retrieved_docs:
-        return {}
-    scores = [
-        item.get("score", 0.0)
-        for item in retrieved_docs
-        if isinstance(item, dict) and "doc" in item
-    ]
-    # Softmax
-    max_s = max(scores) if scores else 0.0
-    exps  = [math.exp(s - max_s) for s in scores]   # subtract max for numerical stability
-    total = sum(exps)
-    weights = [e / total for e in exps]
-
-    result: Dict[str, float] = {}
-    for item, w in zip(retrieved_docs, weights):
-        doc_text = item.get("doc", {}).get("text", "")
-        if doc_text:
-            result[doc_text] = w
-    return result
-
-#! -----> Check doc weights are ranked or not, if not find the max weighted doc and return the max weight for that unit ---Not Done
-
-
-# def _unit_retrieval_weight(unit: str, doc_weights: Dict[str, float]) -> float:
-#     """
-#     Return the retrieval weight for the doc(s) containing `unit`.
-#     - If the unit matches multiple docs, return the highest weight among them.
-#     - If no doc contains the unit, fallback 1e-8
-#       (best available signal) rather than a near-zero constant.
-#     """
-#     if not doc_weights:
-#         return 1e-8
-
-#     unit_norm = re.escape(unit.strip())
-#     matched_weights = [
-#         weight
-#         for doc_text, weight in doc_weights.items()
-#         if re.search(unit_norm, re.sub(r'\s+', ' ', doc_text))
-#     ]
-
-#     if matched_weights:
-#         return max(matched_weights)
-
-#     # No exact match — fall back to the max weight across all docs
-#     return max(doc_weights.values())
-
-
-
-def _unit_retrieval_weight(unit: str, doc_weights: Dict[str, float]) -> float:
-    unit_norm = re.escape(unit.strip())
-    for doc_text, weight in doc_weights.items():
-        if re.search(unit_norm, re.sub(r'\s+', ' ', doc_text)):
-            return weight
-    return 0.0 + 1e-8 # small constant to prevent zeroing out importance
-
-# def _unit_retrieval_weight(
-#     unit: str,
-#     doc_weights: Dict[str, float],
-#     fallback: float = 1.0,
-# ) -> float:
-#     """
-#     Return the retrieval weight of the document that contains `unit`.
-#     Uses substring matching.  Falls back to `fallback` (default 1.0) so
-#     'retrieval_weighted' and 'confidence_retrieval_fusion' gracefully degrade
-#     to the baseline when no retrieval scores are found (e.g. direct-context mode).
-#     """
-#     for doc_text, weight in doc_weights.items():
-#         if unit in doc_text:
-#             return weight
-#     return fallback
+def _low_confidence_explain_response(
+    *,
+    context_used: str,
+    question: str,
+    retrieved_docs: Optional[List[Dict[str, Any]]],
+    max_score: float,
+    threshold: float,
+    debug: bool,
+) -> ExplainResponse:
+    return ExplainResponse(
+        context_used=context_used,
+        prompt=f"Context: {context_used}\nQuestion: {question}\nAnswer:",
+        original_answer="Sorry, I am not confident to answer your question.",
+        token_importances={},
+        retrieved_docs=retrieved_docs,
+        details={
+            "confidence_check": {
+                "max_retrieval_score": max_score,
+                "threshold": threshold,
+                "reason": "Retrieved documents have low relevance scores",
+            }
+        }
+        if debug
+        else None,
+    )
 
 
 @app.post("/explain", response_model=ExplainResponse)
@@ -800,47 +672,35 @@ def explain(req: ExplainRequest):
     # Validate against allowed list
     allowed_ids = {m["id"] for m in AVAILABLE_MODELS}
     if model_id not in allowed_ids:
-        raise HTTPException(status_code=400, detail=f"Unknown model '{model_id}'. Choose from: {sorted(allowed_ids)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{model_id}'. Choose from: {sorted(allowed_ids)}",
+        )
     try:
         gen = _get_generator_for_model(model_id)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Could not load model '{model_id}': {exc}") from exc
+        raise HTTPException(
+            status_code=503, detail=f"Could not load model '{model_id}': {exc}"
+        ) from exc
     if gen is None:
-        raise HTTPException(status_code=503, detail="Generator not ready. Try again in a moment.")
+        raise HTTPException(
+            status_code=503, detail="Generator not ready. Try again in a moment."
+        )
 
     comparator_fn = COMPARATORS.get(req.comparator)
     if comparator_fn is None:
-        raise HTTPException(status_code=400, detail=f"Unknown comparator '{req.comparator}'")
+        raise HTTPException(
+            status_code=400, detail=f"Unknown comparator '{req.comparator}'"
+        )
 
-    # ----------------------------
-    # Context building (direct vs RAG)
-    # ----------------------------
-    retrieved_docs: Optional[List[Dict[str, Any]]] = None
-    context_used = (req.context or "").strip()
-
-    if not context_used:
+    with _DATASET_LOCK:
         try:
-            try:
-                retrieved_docs = retrieve(req.question, req.top_k_docs, retriever=req.retriever)  # type: ignore[arg-type]
-            except TypeError:
-                retrieved_docs = retrieve(req.question, req.top_k_docs)  # type: ignore[misc]
-
-            context_used = "\n".join(
-                [
-                    _cap_doc_text(item["doc"]["text"])
-                    for item in (retrieved_docs or [])
-                    if isinstance(item, dict)
-                    and "doc" in item
-                    and isinstance(item["doc"], dict)
-                    and "text" in item["doc"]
-                ]
-            ).strip()
-
-            if not context_used:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Retriever returned no usable text. Ensure docs.jsonl contains 'text' fields.",
-                )
+            context_used, retrieved_docs = rag_pipeline.build_rag_context(
+                req.question,
+                context=req.context,
+                top_k_docs=req.top_k_docs,
+                retriever=req.retriever,
+            )
         except FileNotFoundError as e:
             raise HTTPException(
                 status_code=500,
@@ -849,253 +709,112 @@ def explain(req: ExplainRequest):
                     "Create data/docs.jsonl and run index building."
                 ),
             ) from e
-        except HTTPException:
-            raise
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"RAG retrieval failed: {e}") from e
+            raise HTTPException(
+                status_code=500, detail=f"RAG retrieval failed: {e}"
+            ) from e
 
-    # ----------------------------
-    # Confidence threshold check
-    # ----------------------------
-    # Check confidence only if we retrieved documents (RAG mode)
-    if retrieved_docs and len(retrieved_docs) > 0:
-        # Get the max score from retrieved docs
-        max_score = max(
-            (item.get("score", 0.0) for item in retrieved_docs if isinstance(item, dict)),
-            default=0.0
-        )
-        
+    if retrieved_docs:
+        max_score = rag_pipeline.max_retrieval_score(retrieved_docs)
         if max_score < req.confidence_threshold:
-            # Return low confidence response without generating answer
-            return ExplainResponse(
+            return _low_confidence_explain_response(
                 context_used=context_used,
-                prompt=f"Context: {context_used}\nQuestion: {req.question}\nAnswer:",
-                original_answer="Sorry, I am not confident to answer your question.",
-                token_importances={},
+                question=req.question,
                 retrieved_docs=retrieved_docs,
-                details={"confidence_check": {
-                    "max_retrieval_score": max_score,
-                    "threshold": req.confidence_threshold,
-                    "reason": "Retrieved documents have low relevance scores"
-                }} if req.debug else None,
+                max_score=max_score,
+                threshold=req.confidence_threshold,
+                debug=req.debug,
             )
 
-    # Validate importance_mode early
-    valid_modes = {"ragex_core", "retrieval_weighted", "confidence_retrieval_fusion"}
-    if req.importance_mode not in valid_modes:
+    if req.importance_mode not in rag_pipeline.VALID_IMPORTANCE_MODES:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown importance_mode '{req.importance_mode}'. Choose from: {sorted(valid_modes)}",
+            detail=(
+                f"Unknown importance_mode '{req.importance_mode}'. "
+                f"Choose from: {sorted(rag_pipeline.VALID_IMPORTANCE_MODES)}"
+            ),
         )
 
-    # Pre-compute retrieval relevance weights once (used by retrieval_weighted
-    # and confidence_retrieval_fusion modes). Empty dict in direct-context mode;
-    # _unit_retrieval_weight falls back to 1.0 (no-op) when no match is found.
-    doc_weights = _softmax_retrieval_weights(retrieved_docs or [])
-    needs_confidence = (req.importance_mode == "confidence_retrieval_fusion")
-
-    # ----------------------------
-    # Baseline generation
-    # ----------------------------
-    prompt = _make_qa_prompt(gen, context_used, req.question)
+    doc_weights = rag_pipeline.softmax_retrieval_weights(retrieved_docs or [])
+    needs_confidence = req.importance_mode == "confidence_retrieval_fusion"
+    prompt = make_qa_prompt(gen, context_used, req.question)
 
     if needs_confidence:
         original, c0 = generate_answer(
-            gen, prompt, max_length=req.max_length, temperature=req.temperature,
+            gen,
+            prompt,
+            max_length=req.max_length,
+            temperature=req.temperature,
             return_confidence=True,
         )
-        c0 = c0 if c0 is not None else 1.0   # default to 1.0 if unavailable
+        c0 = c0 if c0 is not None else 1.0
     else:
-        original = generate_answer(gen, prompt, max_length=req.max_length, temperature=req.temperature)
-        c0 = 1.0  # unused but defined for clarity
-
-    # ----------------------------
-    # Split context into explanation units
-    # ----------------------------
-    try:
-        units = split_context(context_used, req.explanation_level)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid explanation_level: {e}") from e
-
-    if not units:
-        units = [context_used]
-
-    # Cap the number of units to avoid multi-minute waits on long TriviaQA passages.
-    if len(units) > _MAX_UNITS:
-        logger.info(
-            "Capping explanation units from %d to %d (MAX_UNITS)", len(units), _MAX_UNITS
+        original = generate_answer(
+            gen, prompt, max_length=req.max_length, temperature=req.temperature
         )
-        units = units[:_MAX_UNITS]
+        c0 = 1.0
 
-    # ----------------------------
-    # Perturbation loop
-    # ----------------------------
-    raw_dissimilarities: Dict[str, float] = {}
-    confidence_drops: Dict[str, float] = {}  # populated only for confidence_retrieval_fusion
-    debug_details: Dict[str, Any] = {} if req.debug else {}
+    try:
+        units = rag_pipeline.split_explanation_units(
+            context_used, req.explanation_level
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid explanation_level: {e}"
+        ) from e
 
-    # leave_one_out returns the full perturbed context (paper behaviour);
-    # all other strategies return a replacement string for the unit only.
-    is_full_ctx_perturber = (req.perturber == "leave_one_out")
+    signals = rag_pipeline.run_perturbation_loop(
+        gen=gen,
+        make_prompt=lambda ctx, q: make_qa_prompt(gen, ctx, q),
+        context_used=context_used,
+        question=req.question,
+        units=units,
+        perturber=req.perturber,
+        comparator_fn=comparator_fn,
+        original=original,
+        c0=c0,
+        max_length=req.max_length,
+        temperature=req.temperature,
+        collect_confidence=needs_confidence,
+        debug=req.debug,
+        debug_max_perturbations=req.debug_max_perturbations,
+    )
 
-    for i, unit in enumerate(units):
-        perturbs = perturb_sentence(unit, req.perturber, full_text=context_used)
-        if not perturbs:
-            perturbs = ["" if is_full_ctx_perturber else " ".join(
-                u for j, u in enumerate(units) if j != i
-            )]
+    normalized, raw_rw, raw_fusion = rag_pipeline.compute_importance(
+        mode=req.importance_mode,
+        units=units,
+        raw_dissimilarities=signals.raw_dissimilarities,
+        confidence_drops=signals.confidence_drops,
+        doc_weights=doc_weights,
+        alpha=req.alpha,
+    )
 
-        sims: List[float] = []
-        conf_vals: List[float] = []   # perturbed confidences (confidence_retrieval_fusion only)
-        samples: List[Dict[str, Any]] = []
-
-        for p in perturbs:
-            if is_full_ctx_perturber:
-                new_ctx = p
-            else:
-                new_units = units.copy()
-                new_units[i] = p
-                new_ctx = " ".join([u for u in new_units if u is not None])
-
-            new_prompt = _make_qa_prompt(gen, new_ctx, req.question)
-
-            if needs_confidence:
-                # confidence_retrieval_fusion: collect generation confidence alongside answer
-                pert_answer, pert_conf = generate_answer(
-                    gen, new_prompt, max_length=req.max_length,
-                    temperature=req.temperature, return_confidence=True,
-                )
-                if pert_conf is not None:
-                    conf_vals.append(pert_conf)
-            else:
-                pert_answer = generate_answer(
-                    gen, new_prompt, max_length=req.max_length, temperature=req.temperature
-                )
-
-            sim = float(comparator_fn(pert_answer, original))
-            sims.append(sim)
-
-            if req.debug and len(samples) < req.debug_max_perturbations:
-                sample_entry: Dict[str, Any] = {
-                    "perturbed_unit": p,
-                    "new_prompt": new_prompt,
-                    "answer": pert_answer,
-                    "similarity_to_original": sim,
-                }
-                if needs_confidence and conf_vals:
-                    sample_entry["perturbed_confidence"] = conf_vals[-1]
-                samples.append(sample_entry)
-
-        mean_sim   = sum(sims) / max(1, len(sims))
-        raw_dissim = 1.0 - mean_sim
-        raw_dissimilarities[unit] = float(raw_dissim)
-        #! ----> Check if the confidence drop is calculated correctly.----Done
-
-        # Confidence drop (confidence_retrieval_fusion): Δc_i = max(0, c0 - mean(c_i^(j)))
-        if needs_confidence:
-            mean_pert_conf  = sum(conf_vals) / max(1, len(conf_vals)) if conf_vals else c0
-            delta_c         = abs(c0 - mean_pert_conf)
-            confidence_drops[unit] = float(delta_c)
-
-        if req.debug:
-            debug_entry: Dict[str, Any] = {
-                "unit_index": i,
-                "mean_similarity": float(mean_sim),
-                "raw_dissimilarity": float(raw_dissim),
-                "num_perturbations": len(perturbs),
-                "samples": samples,
-            }
-            if needs_confidence:
-                debug_entry["confidence_drop"] = confidence_drops.get(unit, 0.0)
-            debug_details[unit] = debug_entry
-
-    # ----------------------------
-    # Compute final importance scores based on importance_mode
-    # ----------------------------
-
-    def _normalise(scores_dict: Dict[str, float]) -> Dict[str, float]:
-        """Paper formula: w_i = w'_i / max_j w'_j  (most important unit → 1.0)"""
-        vals = list(scores_dict.values())
-        maxv = max(vals) if vals else 1.0
-        if maxv <= 0:
-            return {k: 0.0 for k in scores_dict}
-        return {k: float(v / maxv) for k, v in scores_dict.items()}
-
-    def _softmax_normalise(scores_dict: Dict[str, float]) -> Dict[str, float]:
-        """Softmax normalisation using torch.nn.functional.softmax."""
-        keys = list(scores_dict.keys())
-        vals = torch.tensor([scores_dict[k] for k in keys], dtype=torch.float32)
-        softmax_vals = torch_F.softmax(vals, dim=0)
-        return {k: float(softmax_vals[i].item()) for i, k in enumerate(keys)}
-
-    # Intermediate scores kept for debug output
-    _normed_our: Dict[str, float] = {}   # softmax(raw_dissimilarities) — used by retrieval_weighted
-    _raw_rw: Dict[str, float] = {}       # pre-softmax product: softmax(dissim) * retrieval_weight
-    _raw_fusion: Dict[str, float] = {}   # pre-softmax fusion scores — used by confidence_retrieval_fusion
-
-    if req.importance_mode == "ragex_core":
-        # ── Perturbation-based generator importance (baseline) ────────────
-        # Softmax normalisation — same scale as RW and Fusion for fair comparison.
-        # w_i = w'_i/max(w'_i)  ← max-norm kept for reference, disabled
-        # normalized = _normalise(raw_dissimilarities)
-        normalized = _softmax_normalise(raw_dissimilarities)
-
-    #! --------> Change the normalisation to softmax in both ret weighted and fusion.----Done
-
-    elif req.importance_mode == "retrieval_weighted":
-        # ── Generator importance gated by retrieval relevance ─────────────
-        # Multiplies each unit's generator importance by the softmax-normalised
-        # retrieval relevance score of the document it originates from.
-        # w_i = normalise( w_i^baseline * r̃_d(i) )
-        # Degrades gracefully to baseline when no retrieval scores exist.
-        _normed_our = _softmax_normalise(raw_dissimilarities)
-
-        # raw product: softmax(dissim) * retrieval_weight  (pre-normalization)
-        _raw_rw: Dict[str, float] = {
-            unit: _normed_our[unit] * _unit_retrieval_weight(unit, doc_weights)
-            for unit in units
-        }
-        # apply softmax on the product so normalized_importance != computed_ret_weighted_score
-        normalized = _softmax_normalise(_raw_rw)
-
-    else:
-        # ── Confidence–retrieval fusion ────────────────────────────────────
-        # Fuses two generator-side signals (response dissimilarity + generation
-        # confidence drop) via α, then gates the result by retrieval relevance.
-        # What is alpha here? It's a fusion weight that balances the contribution(controls the relative weighting) of two generator-side signals:
-        # which is the ideal alpha number to set as default? It depends on the specific use case and the relative importance of the two signals in your context. A common starting point is α=0.5, which gives equal weight to both response dissimilarity and confidence drop. However, you may want to experiment with different values (e.g., 0.3, 0.7) to see how it affects the importance scores in your specific application.
-        # If I set alpha = 1 that means I am giving more weight to? If you set α=1.0, you are giving full weight to response dissimilarity (w'_i) and ignoring generation confidence drop (Δc_i) in the fusion. In this case, the importance scores will be based entirely on how much the answer changes when unit i is perturbed, without considering how much the model's confidence in its answer decreases. Conversely, if you set α=0.0, you would be giving full weight to generation confidence drop and ignoring response dissimilarity.
-        # - Response dissimilarity (w'_i): How much the answer changes when unit i is perturbed. Higher means more important.
-        # - Generation confidence drop (Δc_i): How much the model's confidence in its answer decreases when unit i is perturbed. Higher means more important.
-        # The formula is:
-        # w_i = normalise( [α·w'_i + (1−α)·Δc_i] · r̃_d(i) )
-        
-        # softmax-normalise dissim once outside the loop (used as gating signal)
-        _normed_dissim_fusion = _softmax_normalise(raw_dissimilarities)
-        for unit in units:
-            dissim          = _normed_dissim_fusion.get(unit, 0.0)  # already softmax-normalised
-            confidence_drop = confidence_drops.get(unit, 0.0)
-            retrieval_rel   = _unit_retrieval_weight(unit, doc_weights)
-            #! modified fusion formula
-            _raw_fusion[unit] = (req.alpha * retrieval_rel + (1.0 - req.alpha) * confidence_drop) * dissim
-        normalized = _softmax_normalise(_raw_fusion)
-
+    debug_details = signals.debug_details
     if req.debug:
         for unit, info in debug_details.items():
+            if unit.startswith("_"):
+                continue
             info["normalized_importance"] = normalized.get(unit, 0.0)
-            if req.importance_mode in ("retrieval_weighted", "confidence_retrieval_fusion"):
-                info["retrieval_weight"] = _unit_retrieval_weight(unit, doc_weights)
+            if req.importance_mode in (
+                "retrieval_weighted",
+                "confidence_retrieval_fusion",
+            ):
+                info["retrieval_weight"] = rag_pipeline.unit_retrieval_weight(
+                    unit, doc_weights
+                )
             if req.importance_mode == "retrieval_weighted":
-                # computed_ret_weighted_score = softmax(dissim)[unit] * retrieval_weight  (pre-softmax of product)
-                info["computed_ret_weighted_score"] = _raw_rw.get(unit, 0.0)
+                info["computed_ret_weighted_score"] = raw_rw.get(unit, 0.0)
             if req.importance_mode == "confidence_retrieval_fusion":
-                # computed_fusion_score = (α·retrieval_weight + (1−α)·conf_drop) · softmax(dissim)  (pre-softmax)
-                info["computed_fusion_score"] = _raw_fusion.get(unit, 0.0)
+                info["computed_fusion_score"] = raw_fusion.get(unit, 0.0)
         debug_details["_baseline"] = {
             "original_answer": original,
             "prompt": prompt,
             "importance_mode": req.importance_mode,
-            "alpha": req.alpha if req.importance_mode == "confidence_retrieval_fusion" else None,
+            "alpha": req.alpha
+            if req.importance_mode == "confidence_retrieval_fusion"
+            else None,
             "baseline_confidence": c0 if needs_confidence else None,
         }
 
@@ -1124,6 +843,7 @@ def explain(req: ExplainRequest):
 # enabling side-by-side cross-mode comparison in the Debug View tab.
 # ---------------------------------------------------------------------------
 
+
 @app.post("/compare", response_model=CompareResponse)
 def compare(req: CompareRequest):
     """
@@ -1139,151 +859,108 @@ def compare(req: CompareRequest):
     try:
         gen = _get_generator_for_model(model_id)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Could not load model '{model_id}': {exc}") from exc
+        raise HTTPException(
+            status_code=503, detail=f"Could not load model '{model_id}': {exc}"
+        ) from exc
 
     comparator_fn = COMPARATORS.get(req.comparator)
     if comparator_fn is None:
-        raise HTTPException(status_code=400, detail=f"Unknown comparator '{req.comparator}'")
+        raise HTTPException(
+            status_code=400, detail=f"Unknown comparator '{req.comparator}'"
+        )
 
-    # --- Context building ---------------------------------------------------
-    retrieved_docs: Optional[List[Dict[str, Any]]] = None
-    context_used = (req.context or "").strip()
-    if not context_used:
+    with _DATASET_LOCK:
         try:
-            try:
-                retrieved_docs = retrieve(req.question, req.top_k_docs, retriever=req.retriever)  # type: ignore
-            except TypeError:
-                retrieved_docs = retrieve(req.question, req.top_k_docs)  # type: ignore
-            context_used = "\n".join([
-                _cap_doc_text(item["doc"]["text"])
-                for item in (retrieved_docs or [])
-                if isinstance(item, dict) and "doc" in item and "text" in item["doc"]
-            ]).strip()
-            if not context_used:
-                raise HTTPException(status_code=500, detail="Retriever returned no usable text.")
-        except HTTPException:
-            raise
+            context_used, retrieved_docs = rag_pipeline.build_rag_context(
+                req.question,
+                context=req.context,
+                top_k_docs=req.top_k_docs,
+                retriever=req.retriever,
+            )
+        except FileNotFoundError as e:
+            raise HTTPException(
+                status_code=500,
+                detail="Retriever index/doc store missing. Build indices first.",
+            ) from e
+        except ValueError as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"RAG retrieval failed: {e}") from e
+            raise HTTPException(
+                status_code=500, detail=f"RAG retrieval failed: {e}"
+            ) from e
 
     if retrieved_docs:
-        max_score = max(
-            (item.get("score", 0.0) for item in retrieved_docs if isinstance(item, dict)), default=0.0
-        )
+        max_score = rag_pipeline.max_retrieval_score(retrieved_docs)
         if max_score < req.confidence_threshold:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"Max retrieval score ({max_score:.3f}) is below the confidence threshold "
-                    f"({req.confidence_threshold}). Lower the threshold or rephrase the question."
-                ),
+            return CompareResponse(
+                context_used=context_used,
+                prompt=f"Context: {context_used}\nQuestion: {req.question}\nAnswer:",
+                original_answer="Sorry, I am not confident to answer your question.",
+                retrieved_docs=retrieved_docs,
+                alpha=req.alpha,
+                units=[],
             )
 
-    doc_weights = _softmax_retrieval_weights(retrieved_docs or [])
-
-    # --- Baseline generation (always collect confidence for fusion) ----------
-    prompt = _make_qa_prompt(gen, context_used, req.question)
+    doc_weights = rag_pipeline.softmax_retrieval_weights(retrieved_docs or [])
+    prompt = make_qa_prompt(gen, context_used, req.question)
     original, c0 = generate_answer(
-        gen, prompt, max_length=req.max_length, temperature=req.temperature, return_confidence=True
+        gen,
+        prompt,
+        max_length=req.max_length,
+        temperature=req.temperature,
+        return_confidence=True,
     )
     c0 = c0 if c0 is not None else 1.0
 
-    # --- Split context -------------------------------------------------------
     try:
-        units = split_context(context_used, req.explanation_level)
+        units = rag_pipeline.split_explanation_units(
+            context_used, req.explanation_level
+        )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid explanation_level: {e}") from e
-    if not units:
-        units = [context_used]
+        raise HTTPException(
+            status_code=400, detail=f"Invalid explanation_level: {e}"
+        ) from e
 
-    # Cap units to avoid extremely long perturbation loops on TriviaQA passages.
-    if len(units) > _MAX_UNITS:
-        logger.info("Capping compare units from %d to %d (MAX_UNITS)", len(units), _MAX_UNITS)
-        units = units[:_MAX_UNITS]
+    signals = rag_pipeline.run_perturbation_loop(
+        gen=gen,
+        make_prompt=lambda ctx, q: make_qa_prompt(gen, ctx, q),
+        context_used=context_used,
+        question=req.question,
+        units=units,
+        perturber=req.perturber,
+        comparator_fn=comparator_fn,
+        original=original,
+        c0=c0,
+        max_length=req.max_length,
+        temperature=req.temperature,
+        collect_confidence=True,
+    )
 
-    # --- Single perturbation pass: collect raw_dissim + confidence_drop ------
-    raw_dissimilarities: Dict[str, float] = {}
-    confidence_drops: Dict[str, float] = {}
-    is_full_ctx_perturber = (req.perturber == "leave_one_out")
+    baseline_imp, ret_weighted_imp, fusion_imp = (
+        rag_pipeline.compute_all_mode_importances(
+            units=units,
+            raw_dissimilarities=signals.raw_dissimilarities,
+            confidence_drops=signals.confidence_drops,
+            doc_weights=doc_weights,
+            alpha=req.alpha,
+        )
+    )
 
-    for i, unit in enumerate(units):
-        perturbs = perturb_sentence(unit, req.perturber, full_text=context_used)
-        if not perturbs:
-            perturbs = ["" if is_full_ctx_perturber else " ".join(
-                u for j, u in enumerate(units) if j != i
-            )]
-
-        sims: List[float] = []
-        conf_vals: List[float] = []
-
-        for p in perturbs:
-            if is_full_ctx_perturber:
-                new_ctx = p
-            else:
-                new_units = units.copy()
-                new_units[i] = p
-                new_ctx = " ".join([u for u in new_units if u is not None])
-            new_prompt = _make_qa_prompt(gen, new_ctx, req.question)
-            pert_answer, pert_conf = generate_answer(
-                gen, new_prompt, max_length=req.max_length,
-                temperature=req.temperature, return_confidence=True,
-            )
-            sims.append(float(comparator_fn(pert_answer, original)))
-            if pert_conf is not None:
-                conf_vals.append(pert_conf)
-
-        mean_sim = sum(sims) / max(1, len(sims))
-        raw_dissimilarities[unit] = float(1.0 - mean_sim)
-        mean_pert_conf = sum(conf_vals) / max(1, len(conf_vals)) if conf_vals else c0
-        #! --------------> Change the formula and apply the modulus(absolute) to c0 - mean_pert_conf and other parts of the code as well. ---- Done
-        confidence_drops[unit] = abs(c0 - mean_pert_conf)
-
-    # --- Compute all three importance modes ----------------------------------
-    def _normalise(d: Dict[str, float]) -> Dict[str, float]:
-        vals = list(d.values())
-        maxv = max(vals) if vals else 1.0
-        if maxv <= 0:
-            return {k: 0.0 for k in d}
-        return {k: float(v / maxv) for k, v in d.items()}
-
-    def _softmax_normalise_cmp(d: Dict[str, float]) -> Dict[str, float]:
-        """Softmax normalisation using torch.nn.functional.softmax."""
-        keys = list(d.keys())
-        vals = torch.tensor([d[k] for k in keys], dtype=torch.float32)
-        softmax_vals = torch_F.softmax(vals, dim=0)
-        return {k: float(softmax_vals[i].item()) for i, k in enumerate(keys)}
-
-    # All three modes use softmax normalization so scores are on the same scale
-    # and the delta chart shows genuine differences, not a normalization artefact.
-    # baseline_imp = _normalise(raw_dissimilarities)  ← max-norm kept for reference, disabled
-    baseline_imp = _softmax_normalise_cmp(raw_dissimilarities)
-
-    normed_our = _softmax_normalise_cmp(raw_dissimilarities)
-    raw_rw = {u: normed_our[u] * _unit_retrieval_weight(u, doc_weights) for u in units}
-    ret_weighted_imp = _softmax_normalise_cmp(raw_rw)
-
-    #! modified fusion formula
-    raw_fusion = {
-        u: (req.alpha * _unit_retrieval_weight(u, doc_weights) + (1.0 - req.alpha) * confidence_drops[u])
-           * normed_our[u]
-        for u in units
-    }
-    fusion_imp = _softmax_normalise_cmp(raw_fusion)
-
-    # --- Assign ranks (1 = most important) -----------------------------------
     def _ranks(d: Dict[str, float]) -> Dict[str, int]:
-        return {u: i + 1 for i, u in enumerate(sorted(d, key=lambda x: d[x], reverse=True))}
+        return {
+            u: i + 1 for i, u in enumerate(sorted(d, key=lambda x: d[x], reverse=True))
+        }
 
     base_ranks = _ranks(baseline_imp)
-    rw_ranks   = _ranks(ret_weighted_imp)
-    fus_ranks  = _ranks(fusion_imp)
+    rw_ranks = _ranks(ret_weighted_imp)
+    fus_ranks = _ranks(fusion_imp)
 
     unit_signals: List[UnitSignals] = [
         UnitSignals(
             unit=u,
-            raw_dissimilarity=raw_dissimilarities[u],
-            confidence_drop=confidence_drops[u],
-            retrieval_weight=_unit_retrieval_weight(u, doc_weights),
+            raw_dissimilarity=signals.raw_dissimilarities[u],
+            confidence_drop=signals.confidence_drops[u],
+            retrieval_weight=rag_pipeline.unit_retrieval_weight(u, doc_weights),
             baseline_importance=baseline_imp[u],
             ret_weighted_importance=ret_weighted_imp[u],
             fusion_importance=fusion_imp[u],
@@ -1342,12 +1019,14 @@ def compare(req: CompareRequest):
             _reranked = [retrieved_docs[_gidx]] + [
                 itm for _i, itm in enumerate(retrieved_docs) if _i != _gidx
             ]
-            _cf_ctx = "\n".join([
-                _cap_doc_text(itm["doc"]["text"])
-                for itm in _reranked
-                if isinstance(itm, dict) and "doc" in itm and "text" in itm["doc"]
-            ]).strip()
-            _cf_prompt = _make_qa_prompt(gen, _cf_ctx, req.question)
+            _cf_ctx = "\n".join(
+                [
+                    rag_pipeline.cap_doc_text(itm["doc"]["text"])
+                    for itm in _reranked
+                    if isinstance(itm, dict) and "doc" in itm and "text" in itm["doc"]
+                ]
+            ).strip()
+            _cf_prompt = make_qa_prompt(gen, _cf_ctx, req.question)
             _cf_answer = generate_answer(
                 gen, _cf_prompt, max_length=req.max_length, temperature=req.temperature
             )

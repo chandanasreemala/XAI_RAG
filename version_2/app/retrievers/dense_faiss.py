@@ -3,12 +3,13 @@ import faiss
 import json
 from typing import List, Dict, Any, Tuple, Optional
 from app.config import settings
+from app.retrievers._utils import dedupe_top_k
 
 _EMB_MODEL = SentenceTransformer(settings.EMBEDDING_MODEL)
 
 # In-memory FAISS cache — keyed by (index_path, docs_path) tuple.
 # Invalidated explicitly when the active dataset changes.
-_FAISS_CACHE: Optional[tuple] = None   # (index_path, docs_path, index, docs)
+_FAISS_CACHE: Optional[tuple] = None  # (index_path, docs_path, index, docs)
 
 
 def invalidate_cache() -> None:
@@ -42,9 +43,11 @@ def load_index(index_path: Optional[str] = None):
     docs_path = settings.DOCUMENTS_PATH
 
     # Return cached version if both paths are unchanged
-    if (_FAISS_CACHE is not None
-            and _FAISS_CACHE[0] == index_path
-            and _FAISS_CACHE[1] == docs_path):
+    if (
+        _FAISS_CACHE is not None
+        and _FAISS_CACHE[0] == index_path
+        and _FAISS_CACHE[1] == docs_path
+    ):
         return _FAISS_CACHE[2], _FAISS_CACHE[3]
 
     index = faiss.read_index(index_path)
@@ -57,6 +60,7 @@ def load_index(index_path: Optional[str] = None):
     _FAISS_CACHE = (index_path, docs_path, index, docs)
     return index, docs
 
+
 def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
     idx, docs = load_index()
     q_emb = _EMB_MODEL.encode([query], convert_to_numpy=True)
@@ -64,17 +68,7 @@ def retrieve(query: str, k: int = 5) -> List[Dict[str, Any]]:
     # Fetch extra candidates so we can deduplicate and still return k results
     D, I = idx.search(q_emb, min(k * 4, len(docs)))
 
-    results: List[Dict[str, Any]] = []
-    seen_texts: set = set()
-    for i, score in zip(I[0], D[0]):
-        if i < 0 or i >= len(docs):
-            continue
-        text = docs[i].get("text", "")
-        norm = text.lower().strip()
-        if norm in seen_texts:
-            continue
-        seen_texts.add(norm)
-        results.append({"doc": docs[i], "score": float(score)})
-        if len(results) == k:
-            break
-    return results
+    candidates = [
+        (docs[i], float(score)) for i, score in zip(I[0], D[0]) if 0 <= i < len(docs)
+    ]
+    return dedupe_top_k(candidates, k)
