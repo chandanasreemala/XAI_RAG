@@ -3,13 +3,13 @@ import random
 import spacy
 import nltk
 from nltk.corpus import wordnet as wn
-import re
 
 # Ensure required resources
 try:
     _ = spacy.load("en_core_web_sm")
 except OSError:
     import spacy.cli
+
     spacy.cli.download("en_core_web_sm")
 nlp = spacy.load("en_core_web_sm")
 
@@ -19,15 +19,17 @@ except LookupError:
     nltk.download("wordnet")
     nltk.download("omw-1.4")
 
+
 def tokenize_sentences(text: str) -> List[str]:
     doc = nlp(text)
     return [sent.text.strip() for sent in doc.sents]
+
 
 def split_context(text: str, level: str):
     """
     Split context into units based on explanation granularity.
 
-    level ∈ {"word", "sentence", "paragraph"}
+    level ∈ {"word", "sentence", "phrase", "paragraph"}
     """
     text = (text or "").strip()
     if not text:
@@ -52,7 +54,11 @@ def split_context(text: str, level: str):
             return chunks
         # Fallback: non-overlapping 2-word windows when no noun chunks found.
         words = text.split()
-        return [" ".join(words[i:i+2]) for i in range(0, len(words), 2) if words[i:i+2]]
+        return [
+            " ".join(words[i : i + 2])
+            for i in range(0, len(words), 2)
+            if words[i : i + 2]
+        ]
 
     raise ValueError(f"Unknown explanation_level: {level}")
 
@@ -65,7 +71,12 @@ def leave_one_out(full_text: str, unit: str) -> List[str]:
         text.replace(token, "").strip()
     Returns a list with a single perturbed context string.
     """
-    return [full_text.replace(unit, "").strip()]
+    # Remove only the first occurrence to avoid wiping repeated spans.
+    idx = full_text.find(unit)
+    if idx < 0:
+        return [full_text.strip()]
+    return [(full_text[:idx] + full_text[idx + len(unit) :]).strip()]
+
 
 def random_noise(tokens: List[str], vocabulary: List[str], repeats=3) -> List[str]:
     perturbs = []
@@ -76,6 +87,7 @@ def random_noise(tokens: List[str], vocabulary: List[str], repeats=3) -> List[st
             new.insert(insert_idx, random.choice(vocabulary))
             perturbs.append(" ".join(new))
     return perturbs
+
 
 def entity_manipulation(sent: str, random_vocab: List[str], repeats=2) -> List[str]:
     doc = nlp(sent)
@@ -92,6 +104,7 @@ def entity_manipulation(sent: str, random_vocab: List[str], repeats=2) -> List[s
             perturbs.append(perturbed)
     return perturbs
 
+
 def _wn_replacements(word: str, mode: str) -> List[str]:
     syns = set()
     for s in wn.synsets(word):
@@ -102,6 +115,7 @@ def _wn_replacements(word: str, mode: str) -> List[str]:
                 if l.antonyms():
                     syns.update(a.name().replace("_", " ") for a in l.antonyms())
     return list(syns)
+
 
 def antonym_injection(sent: str) -> List[str]:
     tokens = [tok.text for tok in nlp(sent)]
@@ -115,6 +129,7 @@ def antonym_injection(sent: str) -> List[str]:
                 perturbs.append(" ".join(new))
     return perturbs
 
+
 def synonym_injection(sent: str) -> List[str]:
     tokens = [tok.text for tok in nlp(sent)]
     perturbs = []
@@ -127,6 +142,7 @@ def synonym_injection(sent: str) -> List[str]:
                 perturbs.append(" ".join(new))
     return perturbs
 
+
 def reorder_manipulation(sent: str) -> List[str]:
     tokens = sent.split()
     if len(tokens) < 2:
@@ -135,13 +151,16 @@ def reorder_manipulation(sent: str) -> List[str]:
     random.shuffle(perm)
     return [" ".join(perm)]
 
-def perturb_sentence(sent: str, strategy: str, vocab: List[str]=None, full_text: str=None) -> List[str]:
+
+def perturb_sentence(
+    sent: str, strategy: str, vocab: List[str] = None, full_text: str = None
+) -> List[str]:
     if strategy == "leave_one_out":
         # Paper: remove entire unit from full context (unit-level, not word-level)
         source = full_text if full_text is not None else sent
         return leave_one_out(source, sent)
     if strategy == "random_noise":
-        return random_noise(sent.split(), vocab or ["SOME","RND","WORD"])
+        return random_noise(sent.split(), vocab or ["SOME", "RND", "WORD"])
     if strategy == "entity_perturber":
         return entity_manipulation(sent, vocab or ["Foo", "Bar", "Baz"])
     if strategy == "antonym_perturber":
